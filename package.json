@@ -4,7 +4,20 @@
   "description": "TUI file change review for Pi coding agent — accept, revert, undo agent edits with keyboard-driven UI",
   "keywords": ["pi-package", "pi-extension", "review", "diff", "vet"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weinguyen1224-glitch/pi-vet"
+  },
   "author": "weinguyen",
+  "files": [
+    "LICENSE",
+    "index.ts",
+    "types.ts",
+    "config/",
+    "feature/",
+    "renderer/",
+    "utils/"
+  ],
   "pi": {
     "extensions": ["./index.ts"]
   },
@@ -13,3 +26,4 @@
     "@earendil-works/pi-tui": "*"
   }
 }
+
