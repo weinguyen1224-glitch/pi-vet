@@ -1,9 +1,9 @@
 import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	writeFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Change } from "../types";
@@ -55,56 +55,42 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
 	const changes: Change[] = [];
 	let nextId = 1;
 
-	// Migrate from old pi-review path if present
-	const oldSp = join(cwd, ".pi", "pi-review", "state.json");
-	const newSp = statePath(cwd);
-	if (existsSync(oldSp) && !existsSync(newSp)) {
-		try {
-			const oldDir = dirname(newSp);
-			if (!existsSync(oldDir)) mkdirSync(oldDir, { recursive: true });
-			const oldRaw = readFileSync(oldSp, "utf8");
-			writeFileSync(newSp, oldRaw);
-		} catch {
-			/* migration failed, start fresh */
-		}
-	}
-
-	const sp = newSp;
-	try {
-		if (!existsSync(sp)) return { changes, nextId };
-		const raw = JSON.parse(readFileSync(sp, "utf8"));
-		if (!Array.isArray(raw)) return { changes, nextId };
-		for (const c of raw) {
-			if (!c || typeof c !== "object") continue;
-			if (!existsSync(c.filePath) && c.status === "pending") continue;
-			if (c.checked === undefined) c.checked = true;
-			if (c.timestamp === undefined) c.timestamp = 0;
-			if (c.batchId === undefined) c.batchId = 0;
-			changes.push(c);
-			const num = parseInt(String(c.id).slice(1));
-			if (num >= nextId) nextId = num + 1;
-		}
-	} catch {
-		try {
-			const bak = `${sp}.bak`;
-			if (existsSync(bak)) {
-				const raw = JSON.parse(readFileSync(bak, "utf8"));
-				if (Array.isArray(raw)) {
-					for (const c of raw) {
-						if (!c || typeof c !== "object") continue;
-						if (!existsSync(c.filePath) && c.status === "pending") continue;
-						if (c.checked === undefined) c.checked = true;
-						if (c.timestamp === undefined) c.timestamp = 0;
-						if (c.batchId === undefined) c.batchId = 0;
-						changes.push(c);
-						const num = parseInt(String(c.id).slice(1));
-						if (num >= nextId) nextId = num + 1;
-					}
-				}
-			}
-		} catch {
-			/* both corrupted, start fresh */
-		}
-	}
-	return { changes, nextId };
+  const sp = statePath(cwd);
+  try {
+    if (!existsSync(sp)) return { changes, nextId };
+    const raw = JSON.parse(readFileSync(sp, "utf8"));
+    if (!Array.isArray(raw)) return { changes, nextId };
+    for (const c of raw) {
+      if (!c || typeof c !== "object") continue;
+      if (!existsSync(c.filePath) && c.status === "pending") continue;
+      if (c.checked === undefined) c.checked = true;
+      if (c.timestamp === undefined) c.timestamp = 0;
+      if (c.batchId === undefined) c.batchId = 0;
+      changes.push(c);
+      const num = parseInt(String(c.id).slice(1));
+      if (num >= nextId) nextId = num + 1;
+    }
+  } catch {
+    try {
+      const bak = `${sp}.bak`;
+      if (existsSync(bak)) {
+        const raw = JSON.parse(readFileSync(bak, "utf8"));
+        if (Array.isArray(raw)) {
+          for (const c of raw) {
+            if (!c || typeof c !== "object") continue;
+            if (!existsSync(c.filePath) && c.status === "pending") continue;
+            if (c.checked === undefined) c.checked = true;
+            if (c.timestamp === undefined) c.timestamp = 0;
+            if (c.batchId === undefined) c.batchId = 0;
+            changes.push(c);
+            const num = parseInt(String(c.id).slice(1));
+            if (num >= nextId) nextId = num + 1;
+          }
+        }
+      }
+    } catch {
+      /* both corrupted, start fresh */
+    }
+  }
+  return { changes, nextId };
 }
