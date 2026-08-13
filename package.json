@@ -10,7 +10,6 @@
   },
   "author": "weinguyen",
   "files": [
-    "LICENSE",
     "index.ts",
     "types.ts",
     "config/",
