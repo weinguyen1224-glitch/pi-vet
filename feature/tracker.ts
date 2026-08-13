@@ -3,18 +3,12 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import {
-	dirname,
-	isAbsolute,
-	join,
-	realpathSync,
-	relative,
-	resolve,
-} from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Change } from "../types";
 import { applyHunks, diffFiles, parseHunks } from "../utils/diff";
