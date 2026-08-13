@@ -1,0 +1,4 @@
+.pi/
+node_modules/
+*.tmp
+tmp/
