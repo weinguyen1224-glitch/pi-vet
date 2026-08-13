@@ -90,13 +90,14 @@ export async function renderDiffOverlay(
 			let scrollOffset = 0;
 			const hScroll = { val: 0 };
 			let totalDL = 0;
-			const maxDL = 40;
+			let maxDL = 40;
 
 			return {
 				render(width: number): string[] {
 					const lines: string[] = [];
 					const boxW = width - 2;
 					const innerW = boxW - 2;
+					maxDL = Math.max(10, (process.stdout.rows ?? 40) - 4);
 
 					// Top border
 					const title = ` Diff: ${relPath} `;

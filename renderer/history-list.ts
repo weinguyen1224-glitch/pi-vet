@@ -73,7 +73,10 @@ export async function showHistory(
 					lines.push(theme.fg("accent", theme.bold(summaryParts.join(" "))));
 					lines.push("");
 
-					const maxVisible = Math.min(batch.length, 20);
+					const maxVisible = Math.min(
+						batch.length,
+						Math.max(5, (process.stdout.rows ?? 40) - 6),
+					);
 					const startIdx = Math.max(
 						0,
 						Math.min(

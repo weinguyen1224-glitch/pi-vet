@@ -4,6 +4,8 @@ Review agent file changes in the terminal. Checkbox-driven. Accept or revert. No
 
 pi-vet is for Pi users who want a review checkpoint after every agent turn. If you have ever discovered a bad agent edit ten turns later, pi-vet is for you.
 
+It works in any directory. No git repo needed.
+
 ```bash
 pi install npm:pi-vet
 ```
@@ -135,4 +137,3 @@ State is saved to `.pi/pi-vet/state.json` in your project root. Pending changes 
 ## License
 
 MIT
-
