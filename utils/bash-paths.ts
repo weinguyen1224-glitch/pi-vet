@@ -1,4 +1,4 @@
-import { globSync } from "node:fs";
+import { globSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -36,7 +36,9 @@ function extractVars(command: string): Map<string, string> {
 function expandGlob(p: string): string[] {
 	if (!/[*?[]/.test(p)) return [p];
 	try {
-		const results = globSync(p, { nodir: true, windowsPathsNoEscape: true });
+		const results = globSync(p).filter(
+			(f) => { try { return !statSync(f).isDirectory(); } catch { return false; } },
+		);
 		return results.length > 0 ? results : [p];
 	} catch {
 		return [p];
@@ -100,14 +102,21 @@ export function extractBashPaths(command: string): string[] {
 		}
 	};
 
+	// Helper: push all whitespace-split paths from a captured arg group
+	const pushAll = (raw: string) => {
+		for (const token of raw.trim().split(/\s+/)) {
+			if (token) pushPaths(token);
+		}
+	};
+
 	// 1. Redirections: >, >>, 2>, 2>>, &>, &>>
 	for (const m of command.matchAll(/(?:[0-2&]?>>?|>>?)\s*([^\s;&|]+)/g)) {
 		pushPaths(m[1]);
 	}
 
-	// 2. rm [flags] <paths>
-	for (const m of command.matchAll(/\brm\s+(?:-[^\s]*\s+)*([^\s;&|]+)/g)) {
-		pushPaths(m[1]);
+	// 2. rm [flags] <paths...>
+	for (const m of command.matchAll(/\brm\s+(?:-[^\s]*\s+)*([^;&|]+)/g)) {
+		pushAll(m[1]);
 	}
 
 	// 3. mv <src> <dst>
@@ -126,14 +135,14 @@ export function extractBashPaths(command: string): string[] {
 		pushPaths(m[2]);
 	}
 
-	// 5. touch <paths>
-	for (const m of command.matchAll(/\btouch\s+(?:-[^\s]*\s+)*([^\s;&|]+)/g)) {
-		pushPaths(m[1]);
+	// 5. touch <paths...>
+	for (const m of command.matchAll(/\btouch\s+(?:-[^\s]*\s+)*([^;&|]+)/g)) {
+		pushAll(m[1]);
 	}
 
-	// 6. mkdir <paths>
-	for (const m of command.matchAll(/\bmkdir\s+(?:-[^\s]*\s+)*([^\s;&|]+)/g)) {
-		pushPaths(m[1]);
+	// 6. mkdir <paths...>
+	for (const m of command.matchAll(/\bmkdir\s+(?:-[^\s]*\s+)*([^;&|]+)/g)) {
+		pushAll(m[1]);
 	}
 
 	// 7. echo ... > file
@@ -146,9 +155,9 @@ export function extractBashPaths(command: string): string[] {
 		pushPaths(m[1]);
 	}
 
-	// 9. tee [flags] <paths>
-	for (const m of command.matchAll(/\btee\s+(?:-[^\s]*\s+)*([^\s;&|]+)/g)) {
-		pushPaths(m[1]);
+	// 9. tee [flags] <paths...>
+	for (const m of command.matchAll(/\btee\s+(?:-[^\s]*\s+)*([^;&|]+)/g)) {
+		pushAll(m[1]);
 	}
 
 	// 10. sed -i / perl -i
@@ -156,6 +165,32 @@ export function extractBashPaths(command: string): string[] {
 		/(?:sed|perl)\s+-i[^\s]*\s+(?:-e\s+[^\s]+\s+)?(?:[^\s]+\s+)?([^\s;&|]+)$/,
 	);
 	if (sedMatch) pushPaths(sedMatch[1]);
+
+	// 11. chmod <mode> <paths...>
+	for (const m of command.matchAll(/\bchmod\s+(?:-[^\s]*\s+)*[^\s]+\s+([^;&|]+)/g)) {
+		pushAll(m[1]);
+	}
+
+	// 12. ln [flags] <src> <dst>
+	for (const m of command.matchAll(
+		/\bln\s+(?:-[^\s]*\s+)*([^\s;&|]+)\s+([^\s;&|]+)/g,
+	)) {
+		pushPaths(m[1]);
+		pushPaths(m[2]);
+	}
+
+	// 13. git mv <src> <dst>
+	for (const m of command.matchAll(
+		/\bgit\s+mv\s+(?:-[^\s]*\s+)*([^\s;&|]+)\s+([^\s;&|]+)/g,
+	)) {
+		pushPaths(m[1]);
+		pushPaths(m[2]);
+	}
+
+	// 14. git rm [flags] <paths...>
+	for (const m of command.matchAll(/\bgit\s+rm\s+(?:-[^\s]*\s+)*([^;&|]+)/g)) {
+		pushAll(m[1]);
+	}
 
 	return paths;
 }

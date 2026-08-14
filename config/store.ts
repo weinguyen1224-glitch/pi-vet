@@ -16,6 +16,28 @@ export function statePath(cwd: string): string {
 	return join(cwd, ".pi", "pi-vet", "state.json");
 }
 
+export function configPath(cwd: string): string {
+	return join(cwd, ".pi", "pi-vet", "config.json");
+}
+
+export function loadEnabled(cwd: string): boolean {
+	try {
+		const cp = configPath(cwd);
+		if (!existsSync(cp)) return true;
+		const raw = JSON.parse(readFileSync(cp, "utf8"));
+		return raw.enabled !== false;
+	} catch {
+		return true;
+	}
+}
+
+export function saveEnabled(enabled: boolean, cwd: string): void {
+	const cp = configPath(cwd);
+	const dir = dirname(cp);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(cp, JSON.stringify({ enabled }, null, 2));
+}
+
 export function saveState(changes: Change[], cwd: string): void {
 	// Keep only pending + latest batch (for undo). Drop stale accepted/reverted.
 	const latestBatch = changes
@@ -27,27 +49,26 @@ export function saveState(changes: Change[], cwd: string): void {
 			c.status === "partial" ||
 			c.batchId === latestBatch,
 	);
-	// Deduplicate originalContent: keep first occurrence per filePath
-	// (pending entries come first in the array, so they keep their content)
+	// Deduplicate originalContent: keep first occurrence per filePath.
+	// Build a clean copy for serialization — never mutate in-memory objects.
 	const seen = new Map<string, number>();
-	for (let i = 0; i < keep.length; i++) {
-		const c = keep[i];
+	const serialized = keep.map((c, i) => {
 		if (seen.has(c.filePath)) {
-			c.originalContent = "";
-		} else {
-			seen.set(c.filePath, i);
+			return { ...c, originalContent: "" };
 		}
-	}
+		seen.set(c.filePath, i);
+		return c;
+	});
 
 	const sp = statePath(cwd);
 	const dir = dirname(sp);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	const tmp = `${sp}.tmp`;
-	writeFileSync(tmp, JSON.stringify(keep, null, 2));
+	writeFileSync(tmp, JSON.stringify(serialized, null, 2));
 	try {
 		renameSync(tmp, sp);
 	} catch {
-		writeFileSync(sp, JSON.stringify(keep, null, 2));
+		writeFileSync(sp, JSON.stringify(serialized, null, 2));
 	}
 }
 
@@ -62,7 +83,7 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
     if (!Array.isArray(raw)) return { changes, nextId };
     for (const c of raw) {
       if (!c || typeof c !== "object") continue;
-      if (!existsSync(c.filePath) && c.status === "pending" && !c.existed) continue;
+      if (!existsSync(c.filePath) && (c.status === "pending" || c.status === "partial") && !c.existed) continue;
       if (c.checked === undefined) c.checked = true;
       if (c.timestamp === undefined) c.timestamp = 0;
       if (c.batchId === undefined) c.batchId = 0;
@@ -78,7 +99,7 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
         if (Array.isArray(raw)) {
           for (const c of raw) {
             if (!c || typeof c !== "object") continue;
-            if (!existsSync(c.filePath) && c.status === "pending") continue;
+            if (!existsSync(c.filePath) && (c.status === "pending" || c.status === "partial")) continue;
             if (c.checked === undefined) c.checked = true;
             if (c.timestamp === undefined) c.timestamp = 0;
             if (c.batchId === undefined) c.batchId = 0;

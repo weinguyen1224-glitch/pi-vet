@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import type { Change } from "../types";
+import type { Change, Hunk } from "../types";
 
 // ---------------------------------------------------------------------------
 // Shared helpers for review-list and history-list
@@ -11,6 +11,7 @@ export function countStats(c: Change): { added: number; removed: number } {
 	let added = 0,
 		removed = 0;
 	for (const h of c.hunks) {
+		if (!h.accepted) continue;
 		for (let i = 1; i < h.lines.length; i++) {
 			const l = h.lines[i];
 			if (l.startsWith("+") && !l.startsWith("+++")) added++;
@@ -53,7 +54,6 @@ export function kindLabel(
 // ---------------------------------------------------------------------------
 // Diff overlay (shared between pending review and history)
 // ---------------------------------------------------------------------------
-
 export interface DiffOverlayResult {
 	action: "back";
 }
@@ -82,14 +82,28 @@ export async function renderDiffOverlay(
 			) => Promise<T>;
 		};
 	},
-	diffText: string,
+	hunks: Hunk[],
 	relPath: string,
+	onHunkToggle?: () => void,
 ): Promise<DiffOverlayResult> {
+	// Build diff lines from hunks + line→hunk index map
+	const diffLines: string[] = [];
+	const hunkMap: number[] = []; // diffLines[i] → hunk index (-1 = no hunk)
+	for (let hi = 0; hi < hunks.length; hi++) {
+		const h = hunks[hi];
+		diffLines.push(h.header);
+		hunkMap.push(hi);
+		for (let li = 1; li < h.lines.length; li++) {
+			diffLines.push(h.lines[li]);
+			hunkMap.push(hi);
+		}
+	}
+
 	await ctx.ui.custom<void>(
 		(tui, theme, _kb, done) => {
 			let scrollOffset = 0;
 			const hScroll = { val: 0 };
-			let totalDL = 0;
+			let totalDL = diffLines.length;
 			let maxDL = 40;
 
 			return {
@@ -111,9 +125,6 @@ export async function renderDiffOverlay(
 						),
 					);
 
-					// Diff lines
-					const diffLines = diffText.split("\n");
-					totalDL = diffLines.length;
 					const startDL = Math.max(
 						0,
 						Math.min(scrollOffset, Math.max(0, totalDL - maxDL)),
@@ -122,9 +133,18 @@ export async function renderDiffOverlay(
 
 					for (let i = startDL; i < endDL; i++) {
 						const raw = diffLines[i];
+						const hi = hunkMap[i];
+						const isHeader = hi >= 0 && raw.startsWith("@@");
+
+						// Hunk toggle prefix on header lines
+						let prefix = "";
+						if (isHeader) {
+							const h = hunks[hi];
+							prefix = h.accepted ? "[✓] " : "[ ] ";
+						}
 
 						// Horizontal scroll left
-						let text = raw;
+						let text = prefix + raw;
 						let skippedW = 0;
 						let skipChars = 0;
 						for (let ci = 0; ci < text.length; ci++) {
@@ -137,7 +157,7 @@ export async function renderDiffOverlay(
 
 						// Overflow arrows needed?
 						const showLeftArrow = hScroll.val > 0;
-						const showRightArrow = visibleWidth(raw) > hScroll.val + innerW;
+						const showRightArrow = visibleWidth(prefix + raw) > hScroll.val + innerW;
 
 						// Truncate to innerW
 						const maxTextW =
@@ -192,7 +212,7 @@ export async function renderDiffOverlay(
 					// Bottom border
 					const scrollInfo =
 						totalDL > maxDL ? ` ${startDL + 1}-${endDL}/${totalDL} ` : "";
-					const footer = ` esc back  ↑↓ ctrl+u/d g/G  ←→ h/H scroll${scrollInfo} `;
+					const footer = ` esc back  ↑↓ ctrl+u/d g/G  ←→ h/H scroll  ␣ toggle hunk${scrollInfo} `;
 					const fPad = Math.max(0, boxW - visibleWidth(footer));
 					lines.push(
 						theme.fg("borderAccent", `╰${footer}${"─".repeat(fPad)}╯`),
@@ -234,6 +254,14 @@ export async function renderDiffOverlay(
 					} else if (data === "H") {
 						hScroll.val = 99999;
 						tui.requestRender();
+					} else if (data === " ") {
+						// Toggle hunk at current scroll position
+						const hi = hunkMap[scrollOffset];
+						if (hi >= 0) {
+							hunks[hi].accepted = !hunks[hi].accepted;
+							if (onHunkToggle) onHunkToggle();
+							tui.requestRender();
+						}
 					} else if (matchesKey(data, "escape")) {
 						done();
 					}

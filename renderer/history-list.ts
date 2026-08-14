@@ -33,20 +33,6 @@ export async function showHistory(
 		c.checked = c.status === "accepted";
 	}
 
-	// Reconstruct diff from stored hunks — history always shows original diff
-	function buildDiffView(c: Change): string {
-		const lines: string[] = [];
-		lines.push(`--- a/${c.relPath}`);
-		lines.push(`+++ b/${c.relPath}`);
-		for (const h of c.hunks) {
-			lines.push(h.header);
-			for (let i = 1; i < h.lines.length; i++) {
-				lines.push(h.lines[i]);
-			}
-		}
-		return lines.join("\n");
-	}
-
 	let listAction: "quit" | "diff" | "undo" | "apply" = "quit";
 	let diffTarget: Change | null = null;
 
@@ -55,10 +41,23 @@ export async function showHistory(
 		// ---- HISTORY LIST (no overlay, replaces editor) ----
 		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 			let selectedIdx = 0;
+			let filter = "";
+			let filtering = false;
+
+			function filtered(): number[] {
+				if (!filter) return batch.map((_, i) => i);
+				const q = filter.toLowerCase();
+				const result: number[] = [];
+				for (let i = 0; i < batch.length; i++) {
+					if (batch[i].relPath.toLowerCase().includes(q)) result.push(i);
+				}
+				return result;
+			}
 
 			return {
 				render(width: number): string[] {
 					const lines: string[] = [];
+					const flt = filtered();
 
 					// Batch summary header
 					let totalAdded = 0,
@@ -77,23 +76,29 @@ export async function showHistory(
 					if (totalRemoved > 0)
 						summaryParts.push(theme.fg("error", `-${totalRemoved}`));
 					lines.push(theme.fg("accent", theme.bold(summaryParts.join(" "))));
+					// Filter bar
+					if (filtering) {
+						lines.push(theme.fg("accent", ` filter: ${filter}_`));
+					} else if (filter) {
+						lines.push(theme.fg("dim", ` filter: ${filter} (${flt.length} match)`));
+					}
 					lines.push("");
 
 					const maxVisible = Math.min(
-						batch.length,
-						Math.max(5, (process.stdout.rows ?? 40) - 6),
+						flt.length,
+						Math.max(5, (process.stdout.rows ?? 40) - 7),
 					);
 					const startIdx = Math.max(
 						0,
 						Math.min(
 							selectedIdx - Math.floor(maxVisible / 2),
-							batch.length - maxVisible,
+							flt.length - maxVisible,
 						),
 					);
-					const endIdx = Math.min(startIdx + maxVisible, batch.length);
+					const endIdx = Math.min(startIdx + maxVisible, flt.length);
 
 					for (let i = startIdx; i < endIdx; i++) {
-						const c = batch[i];
+						const c = batch[flt[i]];
 						const { added, removed } = countStats(c);
 						const kind = changeKind(c, "hunks");
 						const check = c.checked ? "[✓]" : "[ ]";
@@ -129,6 +134,7 @@ export async function showHistory(
 						{ key: "␣", label: "toggle" },
 						{ key: "a", label: "all" },
 						{ key: "r", label: "none" },
+						{ key: "/", label: "filter" },
 						{ key: "⏎", label: "diff" },
 						{ key: "esc", label: "apply" },
 						{ key: "u", label: "undo" },
@@ -144,19 +150,54 @@ export async function showHistory(
 				invalidate() {},
 
 				handleInput(data: string): void {
+					if (filtering) {
+						if (matchesKey(data, "escape")) {
+							filtering = false;
+							filter = "";
+							selectedIdx = 0;
+							tui.requestRender();
+							return;
+						}
+						if (matchesKey(data, "enter")) {
+							filtering = false;
+							selectedIdx = 0;
+							tui.requestRender();
+							return;
+						}
+						if (matchesKey(data, "backspace")) {
+							filter = filter.slice(0, -1);
+							selectedIdx = 0;
+							tui.requestRender();
+							return;
+						}
+						if (data.length === 1 && data >= " ") {
+							filter += data;
+							selectedIdx = 0;
+							tui.requestRender();
+							return;
+						}
+						return;
+					}
+
+					const flt = filtered();
 					if (matchesKey(data, "up") || data === "k") {
 						selectedIdx = Math.max(0, selectedIdx - 1);
 						tui.requestRender();
 					} else if (matchesKey(data, "down") || data === "j") {
-						selectedIdx = Math.min(batch.length - 1, selectedIdx + 1);
+						selectedIdx = Math.min(flt.length - 1, selectedIdx + 1);
 						tui.requestRender();
 					} else if (data === " ") {
-						const c = batch[selectedIdx];
-						if (c) {
-							c.checked = !c.checked;
+						const idx = flt[selectedIdx];
+						if (idx !== undefined) {
+							batch[idx].checked = !batch[idx].checked;
 							saveState(changes, cwd);
 							tui.requestRender();
 						}
+					} else if (data === "/") {
+						filtering = true;
+						filter = "";
+						selectedIdx = 0;
+						tui.requestRender();
 					} else if (data === "a") {
 						for (const c of batch) c.checked = true;
 						saveState(changes, cwd);
@@ -166,9 +207,9 @@ export async function showHistory(
 						saveState(changes, cwd);
 						tui.requestRender();
 					} else if (matchesKey(data, "enter")) {
-						const c = batch[selectedIdx];
-						if (c) {
-							diffTarget = c;
+						const idx = flt[selectedIdx];
+						if (idx !== undefined) {
+							diffTarget = batch[idx];
 							listAction = "diff";
 							done();
 						}
@@ -194,7 +235,6 @@ export async function showHistory(
           writeFileSync(c.filePath, modified, "utf8");
         } else {
           rmSync(c.filePath, { force: true });
-          // Clean up empty parent dirs
           try {
             const parent = dirname(c.filePath);
             if (readdirSync(parent).length === 0)
@@ -231,7 +271,6 @@ export async function showHistory(
 						writeFileSync(c.filePath, c.originalContent, "utf8");
 					} else {
 						rmSync(c.filePath, { force: true });
-						// Clean up empty parent dirs
 						try {
 							const parent = dirname(c.filePath);
 							if (readdirSync(parent).length === 0)
@@ -250,11 +289,17 @@ export async function showHistory(
 			break;
 		}
 
-		// ---- DIFF VIEW (overlay modal with border, same as pending) ----
+		// ---- DIFF VIEW (overlay modal with border) ----
 		if (listAction === "diff" && diffTarget) {
-			const diffText = buildDiffView(diffTarget);
-			await renderDiffOverlay(ctx, diffText, diffTarget.relPath);
+			const c = diffTarget as Change;
+			await renderDiffOverlay(
+				ctx,
+				c.hunks,
+				c.relPath,
+				() => saveState(changes, cwd),
+			);
 			listAction = "quit";
 		}
 	}
 }
+

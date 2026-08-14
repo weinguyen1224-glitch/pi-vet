@@ -23,12 +23,11 @@ import { saveState } from "../config/store";
 function walkDir(dir: string): string[] {
 	const files: string[] = [];
 	try {
-		const entries = readdirSync(dir, { withFileTypes: true });
-		for (const e of entries) {
-			const full = join(dir, e.name);
-			if (e.isDirectory()) {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const full = join(dir, entry.name);
+			if (entry.isDirectory()) {
 				files.push(...walkDir(full));
-			} else if (e.isFile()) {
+			} else if (entry.isFile()) {
 				files.push(full);
 			}
 		}
@@ -43,21 +42,19 @@ function snapshotPath(
 	abs: string,
 ): Array<{ path: string; content: string; existed: boolean }> {
 	try {
-		const st = statSync(abs);
-		if (st.isDirectory()) {
+		const s = statSync(abs);
+		if (s.isDirectory()) {
 			const files = walkDir(abs);
-			return files.map((f) => {
-				try {
-					return { path: f, content: readFileSync(f, "utf8"), existed: true };
-				} catch {
-					return { path: f, content: "", existed: false };
-				}
-			});
+			return files.map((f) => ({
+				path: f,
+				content: readFileSync(f, "utf8"),
+				existed: true,
+			}));
 		}
-		// Regular file
-		return [{ path: abs, content: readFileSync(abs, "utf8"), existed: true }];
+		return [
+			{ path: abs, content: readFileSync(abs, "utf8"), existed: true },
+		];
 	} catch {
-		// Doesn't exist (yet) — new file
 		return [{ path: abs, content: "", existed: false }];
 	}
 }
@@ -73,20 +70,32 @@ export function createTracker(
 	>();
 
 	function shouldTrack(abs: string): boolean {
-		let resolved = abs;
 		try {
-			resolved = realpathSync(abs);
+			const resolved = realpathSync(abs);
+			return (
+				(resolved === cwd || resolved.startsWith(cwd + "/")) &&
+				!resolved.includes("/node_modules/") &&
+				!resolved.includes("/.git/")
+			);
 		} catch {
-			/* doesn't exist yet */
+			// File doesn't exist yet — check parent
+			const parent = dirname(abs);
+			try {
+				const resolved = realpathSync(parent);
+				return (
+					(resolved === cwd || resolved.startsWith(cwd + "/")) &&
+					!resolved.includes("/node_modules/") &&
+					!resolved.includes("/.git/")
+				);
+			} catch {
+				return false;
+			}
 		}
-		return (
-			resolved.startsWith(cwd) &&
-			!resolved.includes("/node_modules/") &&
-			!resolved.includes("/.git/")
-		);
 	}
-/** Internal URI schemes that should never be tracked as file paths. */
-const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
+
+	/** Internal URI schemes that should never be tracked as file paths. */
+	const INTERNAL_SCHEMES =
+		/^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
 
 	function absOf(p: string): string {
 		return isAbsolute(p) ? p : resolve(cwd, p);
@@ -100,10 +109,10 @@ const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|om
 			writeFileSync(c.filePath, final, "utf8");
 		} else {
 			rmSync(c.filePath, { force: true });
-			// Clean up empty parent dirs
 			try {
 				const parent = dirname(c.filePath);
-				if (readdirSync(parent).length === 0) rmSync(parent, { force: true });
+				if (readdirSync(parent).length === 0)
+					rmSync(parent, { force: true });
 			} catch {
 				/* ignore */
 			}
@@ -112,23 +121,18 @@ const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|om
 
 	function mergeOrPush(change: Change): void {
 		const existing = changes.find(
-			(c) => c.filePath === change.filePath && c.status === "pending",
+			(c) =>
+				c.filePath === change.filePath &&
+				(c.status === "pending" || c.status === "partial"),
 		);
 		if (existing) {
-			let current = "";
-			try {
-				current = readFileSync(change.filePath, "utf8");
-			} catch {
-				/* deleted */
-			}
-			const diff = diffFiles(
-				existing.originalContent,
-				current,
-				change.relPath,
-				cwd,
-			);
-			existing.hunks = parseHunks(diff);
+			existing.hunks = change.hunks;
+			existing.originalContent = change.originalContent;
+			existing.existed = change.existed;
 			existing.toolName = change.toolName;
+			existing.timestamp = change.timestamp;
+			existing.status = "pending";
+			existing.checked = true;
 		} else {
 			changes.push(change);
 		}
@@ -145,12 +149,14 @@ const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|om
 				const input = event.input;
 				let p = "";
 				if (typeof input === "string") {
-					const m = input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/m);
+					// Only match the FIRST section header — use ^ without /m
+					const m = input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/);
 					if (m) p = m[1];
 				} else if (input && typeof input === "object") {
-					p = typeof (input as Record<string, unknown>).path === "string"
-						? (input as Record<string, unknown>).path as string
-						: "";
+					p =
+						typeof (input as Record<string, unknown>).path === "string"
+							? ((input as Record<string, unknown>).path as string)
+							: "";
 				}
 				if (!p || INTERNAL_SCHEMES.test(p)) return;
 				const abs = absOf(p);
@@ -169,12 +175,12 @@ const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|om
 						existed: true,
 					});
 				}
-		} else if (event.toolName === "write") {
-			const input = event.input as Record<string, unknown>;
-			const p = typeof input.path === "string" ? input.path : "";
-			if (!p || INTERNAL_SCHEMES.test(p)) return;
-			const abs = absOf(p);
-			if (!shouldTrack(abs)) return;
+			} else if (event.toolName === "write") {
+				const input = event.input as Record<string, unknown>;
+				const p = typeof input.path === "string" ? input.path : "";
+				if (!p || INTERNAL_SCHEMES.test(p)) return;
+				const abs = absOf(p);
+				if (!shouldTrack(abs)) return;
 				const snapshots = snapshotPath(abs);
 				if (snapshots.length === 1) {
 					originals.set(event.toolCallId, {
@@ -217,7 +223,10 @@ const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|om
 		}
 	}
 
-	function onToolResult(event: { toolName: string; toolCallId: string }): void {
+	function onToolResult(event: {
+		toolName: string;
+		toolCallId: string;
+	}): void {
 		try {
 			if (
 				event.toolName !== "edit" &&

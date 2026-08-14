@@ -38,8 +38,6 @@ export async function showReview(
 		}
 
 		// Always regenerate hunks from disk to ensure freshness.
-		// If regeneration produces empty hunks but we already have hunks
-		// (e.g. file was moved/deleted after tracking), keep the old ones.
 		for (const c of pending) {
 			let current = "";
 			try {
@@ -54,27 +52,6 @@ export async function showReview(
 			}
 		}
 
-		function buildDiff(c: Change): string {
-			let current = "";
-			try {
-				current = readFileSync(c.filePath, "utf8");
-			} catch {
-				/* deleted */
-			}
-			const diff = diffFiles(c.originalContent, current, c.relPath, cwd);
-			// If file was moved/deleted and diff is empty but we have stored hunks,
-			// reconstruct diff from hunks so the overlay still shows the change.
-			if (diff || c.hunks.length === 0) return diff;
-			const lines: string[] = [];
-			lines.push(`--- a/${c.relPath}`);
-			lines.push(`+++ b/${c.relPath}`);
-			for (const h of c.hunks) {
-				lines.push(h.header);
-				for (let i = 1; i < h.lines.length; i++) lines.push(h.lines[i]);
-			}
-			return lines.join("\n");
-		}
-
 		// ---- list -> diff loop ----
 		let listAction: "apply" | "diff" = "apply";
 		let diffTarget: Change | null = null;
@@ -84,10 +61,23 @@ export async function showReview(
 			// ---- FILE LIST (no overlay, replaces editor) ----
 			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 				let selectedIdx = 0;
+				let filter = "";
+				let filtering = false;
+
+				function filtered(): number[] {
+					if (!filter) return pending.map((_, i) => i);
+					const q = filter.toLowerCase();
+					const result: number[] = [];
+					for (let i = 0; i < pending.length; i++) {
+						if (pending[i].relPath.toLowerCase().includes(q)) result.push(i);
+					}
+					return result;
+				}
 
 				return {
 					render(width: number): string[] {
 						const lines: string[] = [];
+						const flt = filtered();
 
 						// Batch summary header
 						let totalAdded = 0,
@@ -104,23 +94,29 @@ export async function showReview(
 						if (totalRemoved > 0)
 							summaryParts.push(theme.fg("error", `-${totalRemoved}`));
 						lines.push(theme.fg("accent", theme.bold(summaryParts.join(" "))));
+						// Filter bar
+						if (filtering) {
+							lines.push(theme.fg("accent", ` filter: ${filter}_`));
+						} else if (filter) {
+							lines.push(theme.fg("dim", ` filter: ${filter} (${flt.length} match)`));
+						}
 						lines.push("");
 
 						const maxVisible = Math.min(
-							pending.length,
-							Math.max(5, (process.stdout.rows ?? 40) - 6),
+							flt.length,
+							Math.max(5, (process.stdout.rows ?? 40) - 7),
 						);
 						const startIdx = Math.max(
 							0,
 							Math.min(
 								selectedIdx - Math.floor(maxVisible / 2),
-								pending.length - maxVisible,
+								flt.length - maxVisible,
 							),
 						);
-						const endIdx = Math.min(startIdx + maxVisible, pending.length);
+						const endIdx = Math.min(startIdx + maxVisible, flt.length);
 
 						for (let i = startIdx; i < endIdx; i++) {
-							const c = pending[i];
+							const c = pending[flt[i]];
 							const { added, removed } = countStats(c);
 							const kind = changeKind(c, "disk");
 							const check = c.checked ? "[✓]" : "[ ]";
@@ -156,6 +152,7 @@ export async function showReview(
 							{ key: "␣", label: "toggle" },
 							{ key: "a", label: "all" },
 							{ key: "r", label: "none" },
+							{ key: "/", label: "filter" },
 							{ key: "⏎", label: "diff" },
 							{ key: "esc", label: "apply" },
 						];
@@ -170,23 +167,58 @@ export async function showReview(
 					invalidate() {},
 
 					handleInput(data: string): void {
+						if (filtering) {
+							if (matchesKey(data, "escape")) {
+								filtering = false;
+								filter = "";
+								selectedIdx = 0;
+								tui.requestRender();
+								return;
+							}
+							if (matchesKey(data, "enter")) {
+								filtering = false;
+								selectedIdx = 0;
+								tui.requestRender();
+								return;
+							}
+							if (matchesKey(data, "backspace")) {
+								filter = filter.slice(0, -1);
+								selectedIdx = 0;
+								tui.requestRender();
+								return;
+							}
+							if (data.length === 1 && data >= " ") {
+								filter += data;
+								selectedIdx = 0;
+								tui.requestRender();
+								return;
+							}
+							return;
+						}
+
+						const flt = filtered();
 						if (matchesKey(data, "up") || data === "k") {
 							selectedIdx = Math.max(0, selectedIdx - 1);
 							tui.requestRender();
 						} else if (matchesKey(data, "down") || data === "j") {
-							selectedIdx = Math.min(pending.length - 1, selectedIdx + 1);
+							selectedIdx = Math.min(flt.length - 1, selectedIdx + 1);
 							tui.requestRender();
 						} else if (data === " ") {
-							const c = pending[selectedIdx];
-							if (c) {
-								c.checked = !c.checked;
+							const idx = flt[selectedIdx];
+							if (idx !== undefined) {
+								pending[idx].checked = !pending[idx].checked;
 								saveState(changes, cwd);
 								tui.requestRender();
 							}
+						} else if (data === "/") {
+							filtering = true;
+							filter = "";
+							selectedIdx = 0;
+							tui.requestRender();
 						} else if (matchesKey(data, "enter")) {
-							const c = pending[selectedIdx];
-							if (c) {
-								diffTarget = c;
+							const idx = flt[selectedIdx];
+							if (idx !== undefined) {
+								diffTarget = pending[idx];
 								listAction = "diff";
 								done();
 							}
@@ -210,8 +242,13 @@ export async function showReview(
 
 			// ---- DIFF VIEW (overlay modal with border) ----
 			if (listAction === "diff" && diffTarget) {
-				const diffText = buildDiff(diffTarget);
-				await renderDiffOverlay(ctx, diffText, diffTarget.relPath);
+				const c = diffTarget as Change;
+				await renderDiffOverlay(
+					ctx,
+					c.hunks,
+					c.relPath,
+					() => saveState(changes, cwd),
+				);
 				listAction = "apply";
 			}
 		}
@@ -230,7 +267,6 @@ export async function showReview(
 					writeFileSync(c.filePath, c.originalContent, "utf8");
 				} else {
 					rmSync(c.filePath, { force: true });
-					// Clean up empty parent dirs
 					try {
 						const parent = dirname(c.filePath);
 						if (readdirSync(parent).length === 0)
@@ -248,3 +284,4 @@ export async function showReview(
 		reviewActive.val = false;
 	}
 }
+

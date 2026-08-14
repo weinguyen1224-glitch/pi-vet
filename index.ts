@@ -13,7 +13,7 @@
  * /vet off → disable tracking. /vet on → re-enable.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadState } from "./config/store";
+import { loadState, loadEnabled, saveEnabled } from "./config/store";
 import { createTracker } from "./feature/tracker";
 import { showReview } from "./renderer/review-list";
 import { showHistory } from "./renderer/history-list";
@@ -23,7 +23,7 @@ export default function (pi: ExtensionAPI) {
 	const { changes, nextId: startId } = loadState(cwd);
 	const nextId = { val: startId };
 	const reviewActive = { val: false };
-	let enabled = true;
+	let enabled = loadEnabled(cwd);
 
 	const tracker = createTracker(cwd, changes, nextId);
 
@@ -61,11 +61,13 @@ export default function (pi: ExtensionAPI) {
 					: "";
 			if (sub === "off") {
 				enabled = false;
+				saveEnabled(false, cwd);
 				ctx.ui.notify("pi-vet tracking disabled", "info");
 				return;
 			}
 			if (sub === "on") {
 				enabled = true;
+				saveEnabled(true, cwd);
 				ctx.ui.notify("pi-vet tracking enabled", "info");
 				return;
 			}
