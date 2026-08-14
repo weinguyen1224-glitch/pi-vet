@@ -85,6 +85,8 @@ export function createTracker(
 			!resolved.includes("/.git/")
 		);
 	}
+/** Internal URI schemes that should never be tracked as file paths. */
+const INTERNAL_SCHEMES = /^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
 
 	function absOf(p: string): string {
 		return isAbsolute(p) ? p : resolve(cwd, p);
@@ -138,12 +140,41 @@ export function createTracker(
 		input: unknown;
 	}): void {
 		try {
-			if (event.toolName === "edit" || event.toolName === "write") {
-				const input = event.input as Record<string, unknown>;
-				const p = typeof input.path === "string" ? input.path : "";
-				if (!p) return;
+			if (event.toolName === "edit") {
+				// edit input is a patch string: "[PATH#TAG]\nPUT ..."
+				const input = event.input;
+				let p = "";
+				if (typeof input === "string") {
+					const m = input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/m);
+					if (m) p = m[1];
+				} else if (input && typeof input === "object") {
+					p = typeof (input as Record<string, unknown>).path === "string"
+						? (input as Record<string, unknown>).path as string
+						: "";
+				}
+				if (!p || INTERNAL_SCHEMES.test(p)) return;
 				const abs = absOf(p);
 				if (!shouldTrack(abs)) return;
+				const snapshots = snapshotPath(abs);
+				if (snapshots.length === 1) {
+					originals.set(event.toolCallId, {
+						path: snapshots[0].path,
+						content: snapshots[0].content,
+						existed: snapshots[0].existed,
+					});
+				} else {
+					originals.set(event.toolCallId, {
+						path: "",
+						content: JSON.stringify(snapshots),
+						existed: true,
+					});
+				}
+		} else if (event.toolName === "write") {
+			const input = event.input as Record<string, unknown>;
+			const p = typeof input.path === "string" ? input.path : "";
+			if (!p || INTERNAL_SCHEMES.test(p)) return;
+			const abs = absOf(p);
+			if (!shouldTrack(abs)) return;
 				const snapshots = snapshotPath(abs);
 				if (snapshots.length === 1) {
 					originals.set(event.toolCallId, {

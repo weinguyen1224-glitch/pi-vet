@@ -1,11 +1,17 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import { saveState } from "../config/store";
 import type { Change } from "../types";
 import { applyHunks } from "../utils/diff";
-import { saveState } from "../config/store";
-import { countStats, changeKind, kindLabel, renderDiffOverlay } from "./shared";
+import { changeKind, countStats, kindLabel, renderDiffOverlay } from "./shared";
 
 // ---------------------------------------------------------------------------
 // History UI (tick + apply per-file, undo all shortcut)
@@ -183,12 +189,20 @@ export async function showHistory(
 			for (const c of batch) {
 				const modified = applyHunks(c.originalContent, c.hunks);
 				if (c.existed || modified.length > 0) {
-					const dir = dirname(c.filePath);
-					if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-					writeFileSync(c.filePath, modified, "utf8");
-				} else {
-					rmSync(c.filePath, { force: true });
-				}
+          const dir = dirname(c.filePath);
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+          writeFileSync(c.filePath, modified, "utf8");
+        } else {
+          rmSync(c.filePath, { force: true });
+          // Clean up empty parent dirs
+          try {
+            const parent = dirname(c.filePath);
+            if (readdirSync(parent).length === 0)
+              rmSync(parent, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
 				c.status = "pending";
 				c.checked = true;
 			}

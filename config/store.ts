@@ -62,7 +62,7 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
     if (!Array.isArray(raw)) return { changes, nextId };
     for (const c of raw) {
       if (!c || typeof c !== "object") continue;
-      if (!existsSync(c.filePath) && c.status === "pending") continue;
+      if (!existsSync(c.filePath) && c.status === "pending" && !c.existed) continue;
       if (c.checked === undefined) c.checked = true;
       if (c.timestamp === undefined) c.timestamp = 0;
       if (c.batchId === undefined) c.batchId = 0;

@@ -2,7 +2,13 @@
   "name": "pi-vet",
   "version": "1.0.2",
   "description": "TUI file change review for Pi coding agent — accept, revert, undo agent edits with keyboard-driven UI",
-  "keywords": ["pi-package", "pi-extension", "review", "diff", "vet"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "review",
+    "diff",
+    "vet"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,11 +24,17 @@
     "utils/"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "~5.8.0",
+    "typescript-language-server": "^5.3.0"
   }
 }
-

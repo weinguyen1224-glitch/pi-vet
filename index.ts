@@ -38,12 +38,8 @@ export default function (pi: ExtensionAPI) {
 		tracker.onToolResult(event);
 	});
 
-	pi.on("agent_end", async () => {
-		tracker.clear();
-	});
-
-	// ---- hooks ----
 	pi.on("agent_end", async (_event, ctx) => {
+		tracker.clear();
 		if (!enabled || !ctx.hasUI) return;
 		await showReview(
 			ctx,
