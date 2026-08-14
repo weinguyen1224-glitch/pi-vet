@@ -311,3 +311,4 @@ export function createTracker(
 
 	return { onToolCall, onToolResult, clear, writeChangeToDisk };
 }
+
