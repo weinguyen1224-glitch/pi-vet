@@ -1,8 +1,10 @@
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -70,10 +72,11 @@ export function createTracker(
 	>();
 
 	function shouldTrack(abs: string): boolean {
+		// Literal path must be under cwd (symlinks may resolve outside)
+		if (abs !== cwd && !abs.startsWith(cwd + "/")) return false;
 		try {
 			const resolved = realpathSync(abs);
 			return (
-				(resolved === cwd || resolved.startsWith(cwd + "/")) &&
 				!resolved.includes("/node_modules/") &&
 				!resolved.includes("/.git/") &&
 				!resolved.includes("/.pi-vet/")
@@ -84,7 +87,6 @@ export function createTracker(
 			try {
 				const resolved = realpathSync(parent);
 				return (
-					(resolved === cwd || resolved.startsWith(cwd + "/")) &&
 					!resolved.includes("/node_modules/") &&
 					!resolved.includes("/.git/")
 				);
@@ -103,6 +105,18 @@ export function createTracker(
 	}
 
 	function writeChangeToDisk(c: Change): void {
+		// Symlink: accept = no-op (tool already created it), reject = remove
+		try {
+			if (lstatSync(c.filePath).isSymbolicLink()) {
+				if (c.status === "reverted") {
+					rmSync(c.filePath, { force: true });
+				}
+				return;
+			}
+		} catch {
+			/* not a symlink, proceed normally */
+		}
+
 		const final = applyHunks(c.originalContent, c.hunks);
 		if (c.existed || final.length > 0) {
 			const dir = dirname(c.filePath);
@@ -272,12 +286,24 @@ export function createTracker(
 			for (const t of targets) {
 				let current = "";
 				let deleted = false;
+				let isSymlink = false;
 				try {
 					current = readFileSync(t.abs, "utf8");
 				} catch {
-					deleted = true;
+					// readFileSync fails on directories and some special files.
+					// Check if it's a symlink (e.g. ln -s /some/dir ./ext).
+					try {
+						if (lstatSync(t.abs).isSymbolicLink()) {
+							isSymlink = true;
+							current = `symlink -> ${readlinkSync(t.abs)}`;
+						} else {
+							deleted = true;
+						}
+					} catch {
+						deleted = true;
+					}
 				}
-				if (!deleted && current === t.originalContent) continue;
+				if (!deleted && !isSymlink && current === t.originalContent) continue;
 
 				const diff = diffFiles(
 					t.originalContent,
@@ -313,5 +339,4 @@ export function createTracker(
 
 	return { onToolCall, onToolResult, clear, writeChangeToDisk };
 }
-
 
