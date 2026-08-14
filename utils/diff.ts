@@ -5,8 +5,11 @@ import type { Hunk } from "../types";
 
 // ---------------------------------------------------------------------------
 // Diff / hunk helpers
-// ---------------------------------------------------------------------------
+// Diff computation and hunk parsing
 
+// SMOKE-TEST: 2026-08-14
+// Diff computation and hunk parsing
+/** Parse unified diff output into Hunk objects. */
 export function parseHunks(diff: string): Hunk[] {
 	if (!diff) return [];
 	const lines = diff.split("\n");
@@ -157,3 +160,5 @@ function simpleDiff(original: string, current: string, rel: string): string {
 	out.push(...hunkLines);
 	return out.join("\n");
 }
+
+

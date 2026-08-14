@@ -75,7 +75,8 @@ export function createTracker(
 			return (
 				(resolved === cwd || resolved.startsWith(cwd + "/")) &&
 				!resolved.includes("/node_modules/") &&
-				!resolved.includes("/.git/")
+				!resolved.includes("/.git/") &&
+				!resolved.includes("/.pi-vet/")
 			);
 		} catch {
 			// File doesn't exist yet — check parent
@@ -145,18 +146,19 @@ export function createTracker(
 	}): void {
 		try {
 			if (event.toolName === "edit") {
-				// edit input is a patch string: "[PATH#TAG]\nPUT ..."
+				// edit input: string patch "[PATH#TAG]\nPUT ..." or object { input: patch }
 				const input = event.input;
 				let p = "";
 				if (typeof input === "string") {
-					// Only match the FIRST section header — use ^ without /m
 					const m = input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/);
 					if (m) p = m[1];
 				} else if (input && typeof input === "object") {
-					p =
-						typeof (input as Record<string, unknown>).path === "string"
-							? ((input as Record<string, unknown>).path as string)
-							: "";
+					const obj = input as Record<string, unknown>;
+					if (typeof obj.path === "string") p = obj.path;
+					else if (typeof obj.input === "string") {
+						const m = obj.input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/);
+						if (m) p = m[1];
+					}
 				}
 				if (!p || INTERNAL_SCHEMES.test(p)) return;
 				const abs = absOf(p);
@@ -311,4 +313,5 @@ export function createTracker(
 
 	return { onToolCall, onToolResult, clear, writeChangeToDisk };
 }
+
 

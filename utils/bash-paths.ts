@@ -94,8 +94,10 @@ export function extractBashPaths(command: string): string[] {
 	const paths: string[] = [];
 	const cmdVars = extractVars(command);
 
-	// Helper: clean and push all expanded paths
+	// Helper: clean and push all expanded paths, filtering shell redirects
 	const pushPaths = (raw: string) => {
+		// Skip shell redirect tokens like "2>", "2>/dev/null", "1>&2"
+		if (/^[0-2&]?>/.test(raw)) return;
 		const expanded = cleanPath(raw, cmdVars);
 		for (const ep of expanded) {
 			if (ep && !paths.includes(ep)) paths.push(ep);
@@ -194,3 +196,4 @@ export function extractBashPaths(command: string): string[] {
 
 	return paths;
 }
+
