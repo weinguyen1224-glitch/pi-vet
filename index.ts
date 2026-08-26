@@ -33,12 +33,13 @@ export default function (pi: ExtensionAPI) {
 		tracker.onToolCall(event);
 	});
 
-	pi.on("tool_result", async (event) => {
+	pi.on("tool_result", async (event, ctx) => {
 		if (!enabled) return;
-		tracker.onToolResult(event);
+		tracker.onToolResult(event, ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
+		const turnIds = tracker.takeTurnIds();
 		tracker.clear();
 		if (!enabled || !ctx.hasUI) return;
 		await showReview(
@@ -47,6 +48,8 @@ export default function (pi: ExtensionAPI) {
 			cwd,
 			reviewActive,
 			tracker.writeChangeToDisk,
+			turnIds,
+			ctx.sessionManager.getSessionId(),
 		);
 	});
 
@@ -98,3 +101,5 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 }
+
+

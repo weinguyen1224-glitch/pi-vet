@@ -70,6 +70,8 @@ export function createTracker(
 		string,
 		{ path: string; content: string; existed: boolean }
 	>();
+	/** Change ids touched during the current agent turn (for agent_end review). */
+	const turnIds = new Set<string>();
 
 	function shouldTrack(abs: string): boolean {
 		// Literal path must be under cwd (symlinks may resolve outside)
@@ -138,6 +140,7 @@ export function createTracker(
 		const existing = changes.find(
 			(c) =>
 				c.filePath === change.filePath &&
+				c.sessionId === change.sessionId &&
 				(c.status === "pending" || c.status === "partial"),
 		);
 		if (existing) {
@@ -148,8 +151,10 @@ export function createTracker(
 			existing.timestamp = change.timestamp;
 			existing.status = "pending";
 			existing.checked = true;
+			turnIds.add(existing.id);
 		} else {
 			changes.push(change);
+			turnIds.add(change.id);
 		}
 	}
 
@@ -239,10 +244,13 @@ export function createTracker(
 		}
 	}
 
-	function onToolResult(event: {
-		toolName: string;
-		toolCallId: string;
-	}): void {
+	function onToolResult(
+		event: {
+			toolName: string;
+			toolCallId: string;
+		},
+		sessionId: string,
+	): void {
 		try {
 			if (
 				event.toolName !== "edit" &&
@@ -325,6 +333,7 @@ export function createTracker(
 					checked: true,
 					timestamp: Date.now(),
 					batchId: 0,
+					sessionId,
 				});
 			}
 			saveState(changes, cwd);
@@ -337,6 +346,15 @@ export function createTracker(
 		originals.clear();
 	}
 
-	return { onToolCall, onToolResult, clear, writeChangeToDisk };
+	/** Return and clear the set of change ids touched this turn. */
+	function takeTurnIds(): Set<string> {
+		const ids = new Set(turnIds);
+		turnIds.clear();
+		return ids;
+	}
+
+	return { onToolCall, onToolResult, clear, takeTurnIds, writeChangeToDisk };
 }
+
+
 

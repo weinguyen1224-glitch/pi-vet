@@ -87,6 +87,7 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
       if (c.checked === undefined) c.checked = true;
       if (c.timestamp === undefined) c.timestamp = 0;
       if (c.batchId === undefined) c.batchId = 0;
+      if (c.sessionId === undefined) c.sessionId = "";
       changes.push(c);
       const num = parseInt(String(c.id).slice(1));
       if (num >= nextId) nextId = num + 1;
@@ -103,6 +104,7 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
             if (c.checked === undefined) c.checked = true;
             if (c.timestamp === undefined) c.timestamp = 0;
             if (c.batchId === undefined) c.batchId = 0;
+            if (c.sessionId === undefined) c.sessionId = "";
             changes.push(c);
             const num = parseInt(String(c.id).slice(1));
             if (num >= nextId) nextId = num + 1;
@@ -115,3 +117,4 @@ export function loadState(cwd: string): { changes: Change[]; nextId: number } {
   }
   return { changes, nextId };
 }
+

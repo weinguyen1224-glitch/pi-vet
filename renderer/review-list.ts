@@ -24,21 +24,28 @@ export async function showReview(
 	cwd: string,
 	reviewActive: { val: boolean },
 	writeChangeToDisk: (c: Change) => void,
+	turnIds?: Set<string>,
+	sessionId?: string,
 ): Promise<void> {
 	if (reviewActive.val) return;
 	reviewActive.val = true;
 
 	try {
 		const pending = changes.filter(
-			(c) => c.status === "pending" || c.status === "partial",
+			(c) =>
+				(c.status === "pending" || c.status === "partial") &&
+				(!sessionId || c.sessionId === sessionId) &&
+				(!turnIds || turnIds.has(c.id)),
 		);
 		if (pending.length === 0) {
 			ctx.ui.notify("No pending changes to review", "info");
 			return;
 		}
-
-		// Always regenerate hunks from disk to ensure freshness.
-		for (const c of pending) {
+		// If the file now matches its original content (e.g. an external edit
+		// reverted the agent's change), the change is moot — drop it so it
+		// doesn't show as a confusing no-op entry.
+		for (let i = pending.length - 1; i >= 0; i--) {
+			const c = pending[i];
 			let current = "";
 			try {
 				current = readFileSync(c.filePath, "utf8");
@@ -47,9 +54,17 @@ export async function showReview(
 			}
 			const diff = diffFiles(c.originalContent, current, c.relPath, cwd);
 			const newHunks = parseHunks(diff);
-			if (newHunks.length > 0 || c.hunks.length === 0) {
+			if (newHunks.length === 0) {
+				const idx = changes.indexOf(c);
+				if (idx !== -1) changes.splice(idx, 1);
+				pending.splice(i, 1);
+			} else {
 				c.hunks = newHunks;
 			}
+		}
+		if (pending.length === 0) {
+			ctx.ui.notify("No pending changes to review", "info");
+			return;
 		}
 
 		// ---- list -> diff loop ----
@@ -284,4 +299,6 @@ export async function showReview(
 		reviewActive.val = false;
 	}
 }
+
+
 

@@ -24,6 +24,10 @@ export interface Change {
 	checked: boolean;
 	timestamp: number;
 	batchId: number;
+	/** Owning agent session id — scopes reviews so concurrent agents in the
+	 *  same folder don't see each other's changes. */
+	sessionId: string;
 }
+
 
 
