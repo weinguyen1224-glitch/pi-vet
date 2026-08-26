@@ -196,7 +196,12 @@ export function createTracker(
 						existed: true,
 					});
 				}
-			} else if (event.toolName === "write") {
+			} else if (
+				event.toolName === "write" ||
+				event.toolName === "replace" ||
+				event.toolName === "insert" ||
+				event.toolName === "undo_last_change"
+			) {
 				const input = event.input as Record<string, unknown>;
 				const p = typeof input.path === "string" ? input.path : "";
 				if (!p || INTERNAL_SCHEMES.test(p)) return;
@@ -255,6 +260,9 @@ export function createTracker(
 			if (
 				event.toolName !== "edit" &&
 				event.toolName !== "write" &&
+				event.toolName !== "replace" &&
+				event.toolName !== "insert" &&
+				event.toolName !== "undo_last_change" &&
 				event.toolName !== "bash"
 			)
 				return;
