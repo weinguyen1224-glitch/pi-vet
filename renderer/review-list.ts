@@ -52,7 +52,7 @@ export async function showReview(
 			} catch {
 				/* deleted */
 			}
-			const diff = diffFiles(c.originalContent, current, c.relPath, cwd);
+			const diff = await diffFiles(c.originalContent, current, c.relPath, cwd);
 			const newHunks = parseHunks(diff);
 			if (newHunks.length === 0) {
 				const idx = changes.indexOf(c);

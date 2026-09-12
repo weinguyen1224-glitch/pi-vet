@@ -30,19 +30,19 @@ export default function (pi: ExtensionAPI) {
 	// ---- tool tracking ----
 	pi.on("tool_call", async (event) => {
 		if (!enabled) return;
-		tracker.onToolCall(event);
+	await tracker.onToolCall(event);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!enabled) return;
-		tracker.onToolResult(event, ctx.sessionManager.getSessionId());
+	await tracker.onToolResult(event, ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		const turnIds = tracker.takeTurnIds();
 		tracker.clear();
 		if (!enabled || !ctx.hasUI) return;
-		await showReview(
+	showReview(
 			ctx,
 			changes,
 			cwd,
@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
 			tracker.writeChangeToDisk,
 			turnIds,
 			ctx.sessionManager.getSessionId(),
-		);
+	).catch(() => {});
 	});
 
 	pi.registerCommand("vet", {

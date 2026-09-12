@@ -1,15 +1,8 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import type { Hunk } from "../types";
 
-// ---------------------------------------------------------------------------
-// Diff / hunk helpers
-// Diff computation and hunk parsing
-
-// SMOKE-TEST: 2026-08-14
-// Diff computation and hunk parsing
-/** Parse unified diff output into Hunk objects. */
 export function parseHunks(diff: string): Hunk[] {
 	if (!diff) return [];
 	const lines = diff.split("\n");
@@ -81,7 +74,7 @@ export function diffFiles(
 	current: string,
 	rel: string,
 	cwd: string,
-): string {
+): Promise<string> {
 	const tmp = join(cwd, ".pi", "pi-vet", "tmp");
 	mkdirSync(tmp, { recursive: true });
 	const id = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -89,23 +82,33 @@ export function diffFiles(
 	const b = join(tmp, `b_${id}.txt`);
 	writeFileSync(a, original);
 	writeFileSync(b, current);
-	let r;
-	try {
-		r = spawnSync(
-			"diff",
-			["-u", "--label", `a/${rel}`, "--label", `b/${rel}`, a, b],
-			{ encoding: "utf8" },
-		);
-	} catch {
-		rmSync(a, { force: true });
-		rmSync(b, { force: true });
-		return simpleDiff(original, current, rel);
-	}
-	rmSync(a, { force: true });
-	rmSync(b, { force: true });
-	if (r.status === 1) return r.stdout;
-	if (r.status !== 0 || r.error) return simpleDiff(original, current, rel);
-	return "";
+	return new Promise((resolve) => {
+		const proc = spawn("diff", [
+			"-u",
+			"--label",
+			`a/${rel}`,
+			"--label",
+			`b/${rel}`,
+			a,
+			b,
+		]);
+		let stdout = "";
+		proc.stdout.on("data", (d: Buffer) => {
+			stdout += d.toString();
+		});
+		proc.on("close", (code) => {
+			rmSync(a, { force: true });
+			rmSync(b, { force: true });
+			if (code === 1) resolve(stdout);
+			else if (code !== 0) resolve(simpleDiff(original, current, rel));
+			else resolve("");
+		});
+		proc.on("error", () => {
+			rmSync(a, { force: true });
+			rmSync(b, { force: true });
+			resolve(simpleDiff(original, current, rel));
+		});
+	});
 }
 
 function simpleDiff(original: string, current: string, rel: string): string {
@@ -160,5 +163,3 @@ function simpleDiff(original: string, current: string, rel: string): string {
 	out.push(...hunkLines);
 	return out.join("\n");
 }
-
-

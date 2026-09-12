@@ -10,6 +10,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Change } from "../types";
@@ -22,14 +23,20 @@ import { saveState } from "../config/store";
 // ---------------------------------------------------------------------------
 
 /** Walk a directory recursively, return all file paths inside. */
-function walkDir(dir: string): string[] {
+const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_FILES = 2000;
+
+async function walkDir(dir: string, budget: { bytes: number; files: number }): Promise<string[]> {
 	const files: string[] = [];
 	try {
-		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const entries = await readdir(dir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (budget.files <= 0) break;
 			const full = join(dir, entry.name);
 			if (entry.isDirectory()) {
-				files.push(...walkDir(full));
+				files.push(...await walkDir(full, budget));
 			} else if (entry.isFile()) {
+				budget.files--;
 				files.push(full);
 			}
 		}
@@ -39,23 +46,26 @@ function walkDir(dir: string): string[] {
 	return files;
 }
 
-/** Snapshot a path: if it's a directory, snapshot all files inside. */
-function snapshotPath(
+// ponytail: 8MiB/2000-file snapshot cap; raise if legit large dirs need full tracking
+async function snapshotPath(
 	abs: string,
-): Array<{ path: string; content: string; existed: boolean }> {
+): Promise<Array<{ path: string; content: string; existed: boolean }>> {
 	try {
-		const s = statSync(abs);
+		const s = await stat(abs);
 		if (s.isDirectory()) {
-			const files = walkDir(abs);
-			return files.map((f) => ({
-				path: f,
-				content: readFileSync(f, "utf8"),
-				existed: true,
-			}));
+			const budget = { bytes: MAX_SNAPSHOT_BYTES, files: MAX_SNAPSHOT_FILES };
+			const files = await walkDir(abs, budget);
+			const out: Array<{ path: string; content: string; existed: boolean }> = [];
+			for (const f of files) {
+				const st = await stat(f);
+				if (st.size > budget.bytes) break;
+				budget.bytes -= st.size;
+				out.push({ path: f, content: await readFile(f, "utf8"), existed: true });
+			}
+			return out;
 		}
-		return [
-			{ path: abs, content: readFileSync(abs, "utf8"), existed: true },
-		];
+		if (s.size > MAX_SNAPSHOT_BYTES) return [];
+		return [{ path: abs, content: await readFile(abs, "utf8"), existed: true }];
 	} catch {
 		return [{ path: abs, content: "", existed: false }];
 	}
@@ -158,11 +168,11 @@ export function createTracker(
 		}
 	}
 
-	function onToolCall(event: {
+	async function onToolCall(event: {
 		toolName: string;
 		toolCallId: string;
 		input: unknown;
-	}): void {
+	}): Promise<void> {
 		try {
 			if (event.toolName === "edit") {
 				// edit input: string patch "[PATH#TAG]\nPUT ..." or object { input: patch }
@@ -182,7 +192,7 @@ export function createTracker(
 				if (!p || INTERNAL_SCHEMES.test(p)) return;
 				const abs = absOf(p);
 				if (!shouldTrack(abs)) return;
-				const snapshots = snapshotPath(abs);
+				const snapshots = await snapshotPath(abs);
 				if (snapshots.length === 1) {
 					originals.set(event.toolCallId, {
 						path: snapshots[0].path,
@@ -207,7 +217,7 @@ export function createTracker(
 				if (!p || INTERNAL_SCHEMES.test(p)) return;
 				const abs = absOf(p);
 				if (!shouldTrack(abs)) return;
-				const snapshots = snapshotPath(abs);
+				const snapshots = await snapshotPath(abs);
 				if (snapshots.length === 1) {
 					originals.set(event.toolCallId, {
 						path: snapshots[0].path,
@@ -234,7 +244,7 @@ export function createTracker(
 				for (const p of paths) {
 					const abs = absOf(p);
 					if (!shouldTrack(abs)) continue;
-					const snapshots = snapshotPath(abs);
+					const snapshots = await snapshotPath(abs);
 					for (const s of snapshots) entries.push(s);
 				}
 				if (entries.length > 0)
@@ -249,13 +259,13 @@ export function createTracker(
 		}
 	}
 
-	function onToolResult(
+	async function onToolResult(
 		event: {
 			toolName: string;
 			toolCallId: string;
 		},
 		sessionId: string,
-	): void {
+	): Promise<void> {
 		try {
 			if (
 				event.toolName !== "edit" &&
@@ -304,7 +314,7 @@ export function createTracker(
 				let deleted = false;
 				let isSymlink = false;
 				try {
-					current = readFileSync(t.abs, "utf8");
+					current = await readFile(t.abs, "utf8");
 				} catch {
 					// readFileSync fails on directories and some special files.
 					// Check if it's a symlink (e.g. ln -s /some/dir ./ext).
@@ -321,7 +331,7 @@ export function createTracker(
 				}
 				if (!deleted && !isSymlink && current === t.originalContent) continue;
 
-				const diff = diffFiles(
+				const diff = await diffFiles(
 					t.originalContent,
 					deleted ? "" : current,
 					relative(cwd, t.abs),
