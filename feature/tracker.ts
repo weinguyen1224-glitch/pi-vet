@@ -73,9 +73,10 @@ async function snapshotPath(
 
 export function createTracker(
 	cwd: string,
-	changes: Change[],
+	getChanges: () => Change[],
 	nextId: { val: number },
 ) {
+	const changes = () => getChanges();
 	const originals = new Map<
 		string,
 		{ path: string; content: string; existed: boolean }
@@ -147,7 +148,7 @@ export function createTracker(
 	}
 
 	function mergeOrPush(change: Change): void {
-		const existing = changes.find(
+		const existing = changes().find(
 			(c) =>
 				c.filePath === change.filePath &&
 				c.sessionId === change.sessionId &&
@@ -163,7 +164,7 @@ export function createTracker(
 			existing.checked = true;
 			turnIds.add(existing.id);
 		} else {
-			changes.push(change);
+			changes().push(change);
 			turnIds.add(change.id);
 		}
 	}
@@ -354,7 +355,7 @@ export function createTracker(
 					sessionId,
 				});
 			}
-			saveState(changes, cwd);
+			saveState(changes(), cwd);
 		} catch {
 			/* ignore */
 		}
@@ -373,6 +374,7 @@ export function createTracker(
 
 	return { onToolCall, onToolResult, clear, takeTurnIds, writeChangeToDisk };
 }
+
 
 
 

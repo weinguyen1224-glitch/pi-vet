@@ -6,7 +6,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Change } from "../types";
+import type { Change, VetState } from "../types";
 
 // ---------------------------------------------------------------------------
 // Persistence
@@ -38,8 +38,11 @@ export function saveEnabled(enabled: boolean, cwd: string): void {
 	writeFileSync(cp, JSON.stringify({ enabled }, null, 2));
 }
 
-export function saveState(changes: Change[], cwd: string): void {
-	// Keep only pending + latest batch (for undo). Drop stale accepted/reverted.
+export function saveState(
+	changes: Change[],
+	cwd: string,
+	lastTurnIds?: string[],
+): void {
 	const latestBatch = changes
 		.filter((c) => c.status === "accepted" || c.status === "reverted")
 		.reduce((max, c) => Math.max(max, c.batchId), 0);
@@ -49,72 +52,98 @@ export function saveState(changes: Change[], cwd: string): void {
 			c.status === "partial" ||
 			c.batchId === latestBatch,
 	);
-	// Deduplicate originalContent: keep first occurrence per filePath.
-	// Build a clean copy for serialization — never mutate in-memory objects.
-	const seen = new Map<string, number>();
-	const serialized = keep.map((c, i) => {
-		if (seen.has(c.filePath)) {
-			return { ...c, originalContent: "" };
-		}
-		seen.set(c.filePath, i);
-		return c;
-	});
-
 	const sp = statePath(cwd);
+	// Omitted lastTurnIds means "keep what is on disk" — renderers persist
+	// checkbox/status edits without knowing the last agent turn.
+	const previous =
+		lastTurnIds === undefined ? (readStateFile(sp)?.lastTurnIds ?? []) : lastTurnIds;
+	const survived = new Set(keep.map((c) => c.id));
+	const state: VetState = {
+		changes: dedupeOriginals(keep),
+		lastTurnIds: previous.filter((id) => survived.has(id)),
+	};
+
 	const dir = dirname(sp);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const body = JSON.stringify(state, null, 2);
 	const tmp = `${sp}.tmp`;
-	writeFileSync(tmp, JSON.stringify(serialized, null, 2));
+	writeFileSync(tmp, body);
 	try {
 		renameSync(tmp, sp);
 	} catch {
-		writeFileSync(sp, JSON.stringify(serialized, null, 2));
+		writeFileSync(sp, body);
 	}
 }
 
-export function loadState(cwd: string): { changes: Change[]; nextId: number } {
+function dedupeOriginals(changes: Change[]): Change[] {
+	const seen = new Set<string>();
+	return changes.map((c) => {
+		if (seen.has(c.filePath)) return { ...c, originalContent: "" };
+		seen.add(c.filePath);
+		return c;
+	});
+}
+
+export function loadState(
+	cwd: string,
+	sessionId = "",
+): { changes: Change[]; lastTurnIds: string[]; nextId: number } {
+	const sp = statePath(cwd);
+	const parsed = readStateFile(sp) ?? readStateFile(`${sp}.bak`);
+	if (!parsed) return { changes: [], lastTurnIds: [], nextId: 1 };
+
 	const changes: Change[] = [];
 	let nextId = 1;
+	for (const c of parsed.changes) {
+		if (!c || typeof c !== "object" || typeof c.filePath !== "string") continue;
+		const num = parseInt(String(c.id).slice(1));
+		if (Number.isFinite(num) && num >= nextId) nextId = num + 1;
+		if (!isReachable(c, sessionId)) continue;
 
-  const sp = statePath(cwd);
-  try {
-    if (!existsSync(sp)) return { changes, nextId };
-    const raw = JSON.parse(readFileSync(sp, "utf8"));
-    if (!Array.isArray(raw)) return { changes, nextId };
-    for (const c of raw) {
-      if (!c || typeof c !== "object") continue;
-      if (!existsSync(c.filePath) && (c.status === "pending" || c.status === "partial") && !c.existed) continue;
-      if (c.checked === undefined) c.checked = true;
-      if (c.timestamp === undefined) c.timestamp = 0;
-      if (c.batchId === undefined) c.batchId = 0;
-      if (c.sessionId === undefined) c.sessionId = "";
-      changes.push(c);
-      const num = parseInt(String(c.id).slice(1));
-      if (num >= nextId) nextId = num + 1;
-    }
-  } catch {
-    try {
-      const bak = `${sp}.bak`;
-      if (existsSync(bak)) {
-        const raw = JSON.parse(readFileSync(bak, "utf8"));
-        if (Array.isArray(raw)) {
-          for (const c of raw) {
-            if (!c || typeof c !== "object") continue;
-            if (!existsSync(c.filePath) && (c.status === "pending" || c.status === "partial")) continue;
-            if (c.checked === undefined) c.checked = true;
-            if (c.timestamp === undefined) c.timestamp = 0;
-            if (c.batchId === undefined) c.batchId = 0;
-            if (c.sessionId === undefined) c.sessionId = "";
-            changes.push(c);
-            const num = parseInt(String(c.id).slice(1));
-            if (num >= nextId) nextId = num + 1;
-          }
-        }
-      }
-    } catch {
-      /* both corrupted, start fresh */
-    }
-  }
-  return { changes, nextId };
+		if (c.checked === undefined) c.checked = true;
+		if (c.timestamp === undefined) c.timestamp = 0;
+		if (c.batchId === undefined) c.batchId = 0;
+		if (c.sessionId === undefined) c.sessionId = "";
+		changes.push(c);
+	}
+
+	const kept = new Set(changes.map((c) => c.id));
+	return {
+		changes,
+		lastTurnIds: parsed.lastTurnIds.filter((id) => kept.has(id)),
+		nextId,
+	};
 }
+
+function readStateFile(path: string): VetState | null {
+	try {
+		if (!existsSync(path)) return null;
+		const raw = JSON.parse(readFileSync(path, "utf8"));
+		const list = Array.isArray(raw) ? raw : raw?.changes;
+		if (!Array.isArray(list)) return null;
+		const ids = Array.isArray(raw?.lastTurnIds) ? raw.lastTurnIds : [];
+		return {
+			changes: list.map(normalizeChange),
+			lastTurnIds: ids.filter((id: unknown) => typeof id === "string"),
+		};
+	} catch {
+		return null;
+	}
+}
+
+function normalizeChange(c: unknown): Change {
+	const record = (c ?? {}) as Change & { accepted?: boolean };
+	if (record.checked === undefined) {
+		record.checked = record.accepted !== false;
+	}
+	return record;
+}
+
+function isReachable(c: Change, sessionId: string): boolean {
+	const stale = c.status !== "pending" && c.status !== "partial";
+	if (stale) return true;
+	if (sessionId && c.sessionId && c.sessionId !== sessionId) return false;
+	return existsSync(c.filePath) || c.existed;
+}
+
 

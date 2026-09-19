@@ -21,7 +21,7 @@ pi install npm:pi-vet
     [x] [new] src/utils.ts  +7
     [ ] [del] src/old.ts    -2
 
-  up/down move | space toggle | a all | r none | enter diff | esc apply
+  ↑↓ move | ␣ toggle | a all | r none | / filter | ⏎ diff | esc apply
 ```
 
 Press Enter to see the full diff for any file.
@@ -71,6 +71,7 @@ Press Enter to see the full diff for any file.
 | Space | Toggle checkbox |
 | a | Select all |
 | r | Deselect all |
+| / | Filter files by name |
 | Enter | Open diff view |
 | Esc | Apply and close |
 | u | Undo batch (history only) |
@@ -92,7 +93,7 @@ Press Enter to see the full diff for any file.
 
 | Command | Action |
 | ------- | ------ |
-| `/vet` | Open review UI (pending or history) |
+| `/vet` | Review the most recent agent turn that changed files (or the last batch) |
 | `/vet off` | Disable tracking |
 | `/vet on` | Re-enable tracking |
 
@@ -104,7 +105,14 @@ pi-vet listens to `edit`, `write`, and `bash` tool events. Before each tool runs
 
 For bash commands, pi-vet parses the command string to find file paths. It recognizes redirections (`>`, `>>`, `2>`), file operations (`rm`, `mv`, `cp`, `touch`, `mkdir`), inline writes (`echo >`, `cat >`, `tee`), and in-place edits (`sed -i`, `perl -i`). It also expands tildes, environment variables, glob patterns, and command-local variable assignments.
 
-State is saved to `.pi/pi-vet/state.json` in your project root. Pending changes survive restarts. The file cleans itself up: only pending changes and the latest history batch are kept.
+State is saved to `.pi/pi-vet/state.json` in your project root. The file cleans itself up: only pending changes and the latest history batch are kept.
+
+Reviews are scoped twice over so `/vet` never drowns you in stale diffs:
+
+- **By session.** A folder can host several agents at once. Each one only sees the pending changes it produced.
+- **By turn.** `/vet` and the end-of-turn review show only the most recent turn that touched files. A read-only turn (just `read`/`grep`) leaves the previous scope intact instead of clearing it.
+
+Older pending changes are dropped from the state file once their session ends — the files on disk are never touched.
 
 ---
 
@@ -122,7 +130,7 @@ State is saved to `.pi/pi-vet/state.json` in your project root. Pending changes 
 
 **Does pi-vet require a git repo?** No. It snapshots file contents directly.
 
-**What if I close Pi with pending changes?** They are saved to `.pi/pi-vet/state.json`. Run `/vet` after restart.
+**What if I close Pi with pending changes?** Pending changes from the current session survive a restart, and `/vet` still finds them. Once that session is gone, its stale pending entries are dropped from the state file.
 
 **Can I use pi-vet alongside git?** Yes. They are independent and do not conflict.
 
@@ -137,4 +145,6 @@ State is saved to `.pi/pi-vet/state.json` in your project root. Pending changes 
 ## License
 
 MIT
+
+
 

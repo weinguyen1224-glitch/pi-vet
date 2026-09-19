@@ -30,4 +30,9 @@ export interface Change {
 }
 
 
+export interface VetState {
+	changes: Change[];
+	/** Change ids produced by the most recent agent turn that touched files. */
+	lastTurnIds: string[];
+}
 

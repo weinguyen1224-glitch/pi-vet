@@ -13,46 +13,69 @@
  * /vet off → disable tracking. /vet on → re-enable.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadState, loadEnabled, saveEnabled } from "./config/store";
+import type { Change } from "./types";
+import { loadState, loadEnabled, saveEnabled, saveState } from "./config/store";
 import { createTracker } from "./feature/tracker";
 import { showReview } from "./renderer/review-list";
 import { showHistory } from "./renderer/history-list";
 
 export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
-	const { changes, nextId: startId } = loadState(cwd);
-	const nextId = { val: startId };
+	const nextId = { val: 1 };
 	const reviewActive = { val: false };
 	let enabled = loadEnabled(cwd);
+	let sessionId = "";
+	let lastTurnIds: string[] = [];
+	let changes: Change[] = [];
+	let hydrated = false;
 
-	const tracker = createTracker(cwd, changes, nextId);
+	const tracker = createTracker(cwd, () => changes, nextId);
+
+	function hydrate(ctx: { sessionManager: { getSessionId(): string } }): void {
+		sessionId = ctx.sessionManager.getSessionId();
+		if (hydrated) return;
+		hydrated = true;
+		const loaded = loadState(cwd, sessionId);
+		changes = loaded.changes;
+		lastTurnIds = loaded.lastTurnIds;
+		nextId.val = Math.max(nextId.val, loaded.nextId);
+	}
+
+	function persist(turnIds: string[] = lastTurnIds): void {
+		lastTurnIds = turnIds;
+		saveState(changes, cwd, lastTurnIds);
+	}
 
 	// ---- tool tracking ----
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return;
-	await tracker.onToolCall(event);
+		hydrate(ctx);
+		await tracker.onToolCall(event);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!enabled) return;
-	await tracker.onToolResult(event, ctx.sessionManager.getSessionId());
+		hydrate(ctx);
+		await tracker.onToolResult(event, ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
+		hydrate(ctx);
 		const turnIds = tracker.takeTurnIds();
 		tracker.clear();
+		if (turnIds.size === 0) return;
+		persist([...turnIds]);
 		if (!enabled || !ctx.hasUI) return;
-	showReview(
+		showReview(
 			ctx,
 			changes,
 			cwd,
 			reviewActive,
 			tracker.writeChangeToDisk,
 			turnIds,
-			ctx.sessionManager.getSessionId(),
-	).catch(() => {});
+			sessionId,
+		).catch(() => {});
 	});
-
 	pi.registerCommand("vet", {
 		description:
 			"Review pending agent changes (or undo last batch). /vet off to disable.",
@@ -75,19 +98,28 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const pending = changes.filter(
+			hydrate(ctx);
+
+			const scoped = changes.filter((c) => c.sessionId === sessionId);
+			const pending = scoped.filter(
 				(c) => c.status === "pending" || c.status === "partial",
 			);
 			if (pending.length > 0) {
+				// Show only the most recent turn that touched files, so /vet never
+				// reopens stale pending changes from earlier turns.
+				const turnIds = new Set(lastTurnIds);
 				await showReview(
 					ctx,
 					changes,
 					cwd,
 					reviewActive,
 					tracker.writeChangeToDisk,
+					turnIds,
+					sessionId,
 				);
+				persist();
 			} else {
-				const history = changes.filter(
+				const history = scoped.filter(
 					(c) => c.status === "accepted" || c.status === "reverted",
 				);
 				if (history.length === 0) {
@@ -97,9 +129,11 @@ export default function (pi: ExtensionAPI) {
 				const latestBatch = Math.max(...history.map((c) => c.batchId));
 				const batch = history.filter((c) => c.batchId === latestBatch);
 				await showHistory(ctx, changes, batch, cwd, tracker.writeChangeToDisk);
+				persist();
 			}
 		},
 	});
 }
+
 
 
