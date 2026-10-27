@@ -1,8 +1,9 @@
 import { realpathSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Base, Step, StepEffect, VetData } from "../types";
-import { diffFiles, parseHunks } from "../utils/diff";
+import { applyHunks, diffFiles, parseHunks, reverseHunks } from "../utils/diff";
 import { extractBashPaths } from "../utils/bash-paths";
 import { diskView, replay, sameState, stepsFor, type FileState } from "./replay";
 
@@ -19,12 +20,15 @@ const TRACKED_TOOLS = new Set([
 	"move",
 	"undo_last_change",
 	"bash",
+	"hypa_shell",
 ]);
+const SHELL_TOOLS = new Set(["bash", "hypa_shell"]);
 const PATH_INPUT_TOOLS = new Set(["write", "undo_last_change"]);
 const OPTIONAL_PATH_TOOLS = new Set(["replace", "replace_match", "insert"]);
-const CROSS_FILE_TOOLS = new Set(["copy", "move"]);
+const ANCHOR_ONLY_TOOLS = new Set(["copy", "move"]);
 const INTERNAL_SCHEMES =
 	/^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
+const PATCH_FILE = /^--- (.+)\n\+\+\+ \1\n(?=@@)/m;
 const PATCH_PATH = /^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/;
 
 interface Snapshot {
@@ -86,7 +90,7 @@ function effectOf(before: FileState, after: FileState): StepEffect {
 	return "mod";
 }
 
-function pathsOf(toolName: string, input: unknown, cwd: string): string[] {
+function pathsOf(toolName: string, input: unknown): string[] {
 	const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
 	if (toolName === "edit") {
 		const patch = typeof input === "string" ? input : obj.input;
@@ -95,9 +99,9 @@ function pathsOf(toolName: string, input: unknown, cwd: string): string[] {
 		return path ? [path] : [];
 	}
 	if (PATH_INPUT_TOOLS.has(toolName)) return typeof obj.path === "string" ? [obj.path] : [];
-	if (OPTIONAL_PATH_TOOLS.has(toolName)) return [typeof obj.path === "string" ? obj.path : cwd];
-	if (CROSS_FILE_TOOLS.has(toolName)) return [cwd];
-	if (toolName === "bash") return extractBashPaths(typeof obj.command === "string" ? obj.command : "");
+	if (OPTIONAL_PATH_TOOLS.has(toolName)) return typeof obj.path === "string" ? [obj.path] : [];
+	if (ANCHOR_ONLY_TOOLS.has(toolName)) return [];
+	if (SHELL_TOOLS.has(toolName)) return extractBashPaths(typeof obj.command === "string" ? obj.command : "");
 	return [];
 }
 
@@ -106,7 +110,6 @@ export function createTracker(cwd: string, getData: () => VetData, save: () => v
 	let touched = false;
 
 	function shouldTrack(abs: string): boolean {
-		if (abs !== cwd && !abs.startsWith(cwd + "/")) return false;
 		const allowed = (path: string) => {
 			const resolved = `${realpathSync(path)}/`;
 			return (
@@ -126,7 +129,17 @@ export function createTracker(cwd: string, getData: () => VetData, save: () => v
 		}
 	}
 
-	const absOf = (p: string) => (isAbsolute(p) ? p : resolve(cwd, p));
+	const absOf = (p: string) => {
+		const expanded = p === "~" || p.startsWith("~/") ? join(homedir(), p.slice(1)) : p;
+		return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+	};
+
+	const displayPath = (abs: string) => {
+		const home = homedir();
+		if (abs === cwd || abs.startsWith(cwd + "/")) return relative(cwd, abs);
+		if (abs.startsWith(home + "/")) return "~" + abs.slice(home.length);
+		return abs;
+	};
 
 	// ponytail: 8MiB/2000-file snapshot cap per tool call; raise if legit large dirs need full tracking
 	async function watch(abs: string, call: PendingCall, budget: { bytes: number }): Promise<void> {
@@ -159,7 +172,7 @@ export function createTracker(cwd: string, getData: () => VetData, save: () => v
 		try {
 			const call: PendingCall = { snapshots: [], watchedFiles: new Set(), watchedDirectories: [] };
 			const budget = { bytes: MAX_SNAPSHOT_BYTES };
-			for (const p of pathsOf(event.toolName, event.input, cwd)) {
+			for (const p of pathsOf(event.toolName, event.input)) {
 				if (INTERNAL_SCHEMES.test(p)) continue;
 				const abs = absOf(p);
 				if (shouldTrack(abs)) await watch(abs, call, budget);
@@ -217,15 +230,37 @@ export function createTracker(cwd: string, getData: () => VetData, save: () => v
 		}
 	}
 
+	async function snapshotsFromPatch(details: unknown): Promise<Snapshot[]> {
+		const { patch, patchTruncated } = (details ?? {}) as { patch?: unknown; patchTruncated?: unknown };
+		if (typeof patch !== "string" || patchTruncated) return [];
+		const parts = patch.split(PATCH_FILE);
+		const recovered: Snapshot[] = [];
+		for (let i = 1; i < parts.length; i += 2) {
+			const path = absOf(parts[i]);
+			const current = await readState(path);
+			if (!current.exists) continue;
+			try {
+				const content = applyHunks(current.content, reverseHunks(parseHunks(parts[i + 1])));
+				recovered.push({ path, content, existed: true });
+			} catch {
+				continue;
+			}
+		}
+		return recovered;
+	}
+
 	async function onToolResult(
-		event: { toolName: string; toolCallId: string },
+		event: { toolName: string; toolCallId: string; details?: unknown },
 		sessionId: string,
 	): Promise<void> {
 		const call = pending.get(event.toolCallId);
-		if (!call) return;
 		pending.delete(event.toolCallId);
+		const needsPatch = ANCHOR_ONLY_TOOLS.has(event.toolName) || OPTIONAL_PATH_TOOLS.has(event.toolName);
+		if (!call && !needsPatch) return;
 		try {
-			const taken = [...call.snapshots, ...(await createdFiles(call))];
+			const taken = call
+				? [...call.snapshots, ...(await createdFiles(call))]
+				: await snapshotsFromPatch(event.details);
 			const data = getData();
 			const plans: Array<{
 				base: Base;
@@ -244,7 +279,7 @@ export function createTracker(cwd: string, getData: () => VetData, save: () => v
 				if (!changed && !drifted) continue;
 				const base: Base = known ?? {
 					filePath: snap.path,
-					relPath: relative(cwd, snap.path),
+					relPath: displayPath(snap.path),
 					sessionId,
 					content: before.content,
 					existed: before.exists,

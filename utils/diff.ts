@@ -18,6 +18,15 @@ export function parseHunks(diff: string): Hunk[] {
 	return hunks;
 }
 
+export function reverseHunks(hunks: Hunk[]): Hunk[] {
+	const flip = (line: string) =>
+		line.startsWith("+") ? `-${line.slice(1)}` : line.startsWith("-") ? `+${line.slice(1)}` : line;
+	return hunks.map((hunk) => {
+		const header = hunk.header.replace(/@@ -(\S+) \+(\S+) @@/, "@@ -$2 +$1 @@");
+		return { ...hunk, header, lines: [header, ...hunk.lines.slice(1).map(flip)] };
+	});
+}
+
 function splitHunk(hunk: Hunk): { oldLines: string[]; newLines: string[] } {
 	const oldLines: string[] = [];
 	const newLines: string[] = [];

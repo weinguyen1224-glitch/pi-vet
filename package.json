@@ -1,6 +1,6 @@
 {
   "name": "pi-vet",
-  "version": "1.0.10",
+  "version": "1.1.1",
   "description": "TUI file change review for Pi coding agent — accept, revert, undo agent edits with keyboard-driven UI",
   "keywords": [
     "pi-package",
