@@ -55,8 +55,19 @@ export default function (pi: ExtensionAPI) {
 		saveSession(cwd, sessionId, { bases: [], steps: [] });
 	});
 
+	const subcommands = [
+		{ value: "history", label: "history", description: "Settled steps, re-apply selectively" },
+		{ value: "rewind", label: "rewind", description: "Reset files back to a past step" },
+		{ value: "off", label: "off", description: "Disable tracking" },
+		{ value: "on", label: "on", description: "Enable tracking" },
+	];
+
 	pi.registerCommand("vet", {
 		description: "Review pending agent changes, or history. /vet history | rewind | off | on.",
+		getArgumentCompletions: (prefix) => {
+			const matches = subcommands.filter((item) => item.value.startsWith(prefix.trim()));
+			return matches.length > 0 ? matches : null;
+		},
 		handler: async (args, ctx) => {
 			const sub = (Array.isArray(args) ? (args[0] ?? "") : typeof args === "string" ? args : "").trim();
 			if (sub === "off" || sub === "on") {
