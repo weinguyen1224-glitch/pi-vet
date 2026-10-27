@@ -1,274 +1,169 @@
-import { readFileSync } from "node:fs";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import type { Change, Hunk } from "../types";
+import type { Hunk, StepEffect } from "../types";
 
-// ---------------------------------------------------------------------------
-// Shared helpers for review-list and history-list
-// ---------------------------------------------------------------------------
-
-/** Count added/removed lines from hunks. */
-export function countStats(c: Change): { added: number; removed: number } {
-	let added = 0,
-		removed = 0;
-	for (const h of c.hunks) {
-		if (!h.accepted) continue;
-		for (let i = 1; i < h.lines.length; i++) {
-			const l = h.lines[i];
-			if (l.startsWith("+") && !l.startsWith("+++")) added++;
-			else if (l.startsWith("-") && !l.startsWith("---")) removed++;
+export function countStats(hunks: Hunk[]): { added: number; removed: number } {
+	let added = 0;
+	let removed = 0;
+	for (const hunk of hunks) {
+		if (!hunk.accepted) continue;
+		for (const line of hunk.lines.slice(1)) {
+			if (line.startsWith("+")) added++;
+			else if (line.startsWith("-")) removed++;
 		}
 	}
 	return { added, removed };
 }
 
-/** Classify change kind. mode="disk" reads current file; mode="hunks" uses hunks.length heuristic. */
-export function changeKind(
-	c: Change,
-	mode: "disk" | "hunks",
-): "new" | "del" | "mod" {
-	if (!c.existed) return "new";
-	if (mode === "disk") {
-		let current = "";
-		try {
-			current = readFileSync(c.filePath, "utf8");
-		} catch {
-			/* gone */
-		}
-		if (current === "" && c.originalContent !== "") return "del";
-	} else {
-		if (c.originalContent !== "" && c.hunks.length === 0) return "del";
-	}
-	return "mod";
-}
-
-/** Kind label with theme color. */
-export function kindLabel(
-	kind: "new" | "del" | "mod",
-	theme: { fg: (c: string, t: string) => string },
-): string {
-	if (kind === "new") return theme.fg("success", "[new]");
-	if (kind === "del") return theme.fg("error", "[del]");
+export function kindLabel(effect: StepEffect, theme: Theme): string {
+	if (effect === "new") return theme.fg("success", "[new]");
+	if (effect === "del") return theme.fg("error", "[del]");
 	return theme.fg("warning", "[mod]");
 }
 
-// ---------------------------------------------------------------------------
-// Diff overlay (shared between pending review and history)
-// ---------------------------------------------------------------------------
-export interface DiffOverlayResult {
-	action: "back";
+function window(text: string, skip: number, max: number): { text: string; width: number } {
+	let skipped = 0;
+	let width = 0;
+	let out = "";
+	for (const ch of text) {
+		const w = visibleWidth(ch);
+		if (skipped < skip) {
+			skipped += w;
+			continue;
+		}
+		if (width + w > max) break;
+		width += w;
+		out += ch;
+	}
+	return { text: out, width };
 }
 
+type OverlayContext = Pick<ExtensionContext, "ui">;
+
 export async function renderDiffOverlay(
-	ctx: {
-		ui: {
-			custom: <T>(
-				factory: (
-					tui: { requestRender: () => void },
-					theme: {
-						fg: (c: string, t: string) => string;
-						bold: (t: string) => string;
-					},
-					_kb: unknown,
-					done: (value?: T) => void,
-				) => {
-					render: (width: number) => string[];
-					invalidate: () => void;
-					handleInput: (data: string) => void;
-				},
-				opts?: {
-					overlay?: boolean;
-					overlayOptions?: { anchor?: string; margin?: number };
-				},
-			) => Promise<T>;
-		};
-	},
+	ctx: OverlayContext,
 	hunks: Hunk[],
-	relPath: string,
+	title: string,
 	onHunkToggle?: () => void,
-): Promise<DiffOverlayResult> {
-	// Build diff lines from hunks + line→hunk index map
+): Promise<void> {
 	const diffLines: string[] = [];
-	const hunkMap: number[] = []; // diffLines[i] → hunk index (-1 = no hunk)
-	for (let hi = 0; hi < hunks.length; hi++) {
-		const h = hunks[hi];
-		diffLines.push(h.header);
-		hunkMap.push(hi);
-		for (let li = 1; li < h.lines.length; li++) {
-			diffLines.push(h.lines[li]);
-			hunkMap.push(hi);
+	const hunkOfLine: number[] = [];
+	hunks.forEach((hunk, hunkIndex) => {
+		diffLines.push(hunk.header);
+		hunkOfLine.push(hunkIndex);
+		for (const line of hunk.lines.slice(1)) {
+			diffLines.push(line);
+			hunkOfLine.push(hunkIndex);
 		}
-	}
+	});
 
 	await ctx.ui.custom<void>(
 		(tui, theme, _kb, done) => {
 			let scrollOffset = 0;
-			const hScroll = { val: 0 };
-			let totalDL = diffLines.length;
-			let maxDL = 40;
+			let cursor = 0;
+			let hScroll = 0;
+			let pageSize = 40;
+			const maxScroll = () => Math.max(0, diffLines.length - pageSize);
+			const moveCursor = (index: number) => {
+				cursor = Math.max(0, Math.min(index, diffLines.length - 1));
+				if (cursor < scrollOffset) scrollOffset = cursor;
+				else if (cursor >= scrollOffset + pageSize) scrollOffset = cursor - pageSize + 1;
+				tui.requestRender();
+			};
 
 			return {
 				render(width: number): string[] {
 					const lines: string[] = [];
-					const boxW = width - 2;
-					const innerW = boxW - 2;
-					maxDL = Math.max(10, (process.stdout.rows ?? 40) - 4);
+					const boxWidth = width - 2;
+					const innerWidth = boxWidth - 2;
+					pageSize = Math.max(10, (process.stdout.rows ?? 40) - 4);
+					scrollOffset = Math.min(scrollOffset, maxScroll());
 
-					// Top border
-					const title = ` Diff: ${relPath} `;
-					const titleW = visibleWidth(title);
-					const tLeft = Math.max(0, Math.floor((boxW - titleW) / 2));
-					const tRight = Math.max(0, boxW - titleW - tLeft);
+					const heading = ` Diff: ${title} `;
+					const left = Math.max(0, Math.floor((boxWidth - visibleWidth(heading)) / 2));
+					const right = Math.max(0, boxWidth - visibleWidth(heading) - left);
 					lines.push(
 						theme.fg(
 							"borderAccent",
-							`╭${"─".repeat(tLeft)}${theme.fg("accent", theme.bold(title))}${theme.fg("borderAccent", "─".repeat(tRight) + "╮")}`,
+							`╭${"─".repeat(left)}${theme.fg("accent", theme.bold(heading))}${theme.fg("borderAccent", "─".repeat(right) + "╮")}`,
 						),
 					);
 
-					const startDL = Math.max(
-						0,
-						Math.min(scrollOffset, Math.max(0, totalDL - maxDL)),
-					);
-					const endDL = Math.min(startDL + maxDL, totalDL);
-
-					for (let i = startDL; i < endDL; i++) {
+					const end = Math.min(scrollOffset + pageSize, diffLines.length);
+					for (let i = scrollOffset; i < end; i++) {
 						const raw = diffLines[i];
-						const hi = hunkMap[i];
-						const isHeader = hi >= 0 && raw.startsWith("@@");
+						const isHeader = raw.startsWith("@@");
+						const prefix = isHeader ? (hunks[hunkOfLine[i]].accepted ? "[✓] " : "[ ] ") : "";
+						const full = prefix + raw;
+						const hasLeft = hScroll > 0;
+						const hasRight = visibleWidth(full) > hScroll + innerWidth;
+						const room = innerWidth - (hasLeft ? 1 : 0) - (hasRight ? 1 : 0);
+						const shown = window(full, hScroll, room);
 
-						// Hunk toggle prefix on header lines
-						let prefix = "";
-						if (isHeader) {
-							const h = hunks[hi];
-							prefix = h.accepted ? "[✓] " : "[ ] ";
-						}
+						let colored = theme.fg("dim", shown.text);
+						if (isHeader) colored = theme.fg("accent", shown.text);
+						else if (raw.startsWith("+")) colored = theme.fg("success", shown.text);
+						else if (raw.startsWith("-")) colored = theme.fg("error", shown.text);
+						if (hasLeft) colored = theme.fg("dim", "◀") + colored;
+						if (hasRight) colored += theme.fg("dim", "▶");
 
-						// Horizontal scroll left
-						let text = prefix + raw;
-						let skippedW = 0;
-						let skipChars = 0;
-						for (let ci = 0; ci < text.length; ci++) {
-							const charW = text[ci].charCodeAt(0) > 127 ? 2 : 1;
-							if (skippedW + charW > hScroll.val) break;
-							skippedW += charW;
-							skipChars = ci + 1;
-						}
-						text = text.slice(skipChars);
-
-						// Overflow arrows needed?
-						const showLeftArrow = hScroll.val > 0;
-						const showRightArrow = visibleWidth(prefix + raw) > hScroll.val + innerW;
-
-						// Truncate to innerW
-						const maxTextW =
-							innerW - (showLeftArrow ? 1 : 0) - (showRightArrow ? 1 : 0);
-						let visibleW = 0;
-						let keepChars = 0;
-						for (let ci = 0; ci < text.length; ci++) {
-							const charW = text[ci].charCodeAt(0) > 127 ? 2 : 1;
-							if (visibleW + charW > maxTextW) break;
-							visibleW += charW;
-							keepChars = ci + 1;
-						}
-						text = text.slice(0, keepChars);
-
-						// Color by diff line type
-						let colored: string;
-						if (raw.startsWith("+") && !raw.startsWith("+++")) {
-							colored = theme.fg("success", text);
-						} else if (raw.startsWith("-") && !raw.startsWith("---")) {
-							colored = theme.fg("error", text);
-						} else if (raw.startsWith("@@")) {
-							colored = theme.fg("accent", text);
-						} else {
-							colored = theme.fg("dim", text);
-						}
-
-						// Overflow arrows after coloring
-						if (showLeftArrow) colored = theme.fg("dim", "◀") + colored;
-						if (showRightArrow) colored = colored + theme.fg("dim", "▶");
-
-						// Pad + borders
-						const leftBorder = theme.fg("borderAccent", "│ ");
-						const rightBorder = theme.fg("borderAccent", " │");
-						const padding =
-							innerW -
-							visibleW -
-							(showLeftArrow ? 1 : 0) -
-							(showRightArrow ? 1 : 0);
+						const padding = innerWidth - shown.width - (hasLeft ? 1 : 0) - (hasRight ? 1 : 0);
 						lines.push(
-							leftBorder +
+							theme.fg("borderAccent", i === cursor ? "│" : "│ ") +
+								(i === cursor ? theme.fg("accent", "▸") : "") +
 								colored +
 								" ".repeat(Math.max(0, padding)) +
-								rightBorder,
+								theme.fg("borderAccent", " │"),
 						);
 					}
 
-					// Fill empty lines
-					for (let i = endDL - startDL; i < maxDL; i++) {
-						lines.push(theme.fg("borderAccent", `│${" ".repeat(innerW + 2)}│`));
+					for (let i = end - scrollOffset; i < pageSize; i++) {
+						lines.push(theme.fg("borderAccent", `│${" ".repeat(innerWidth + 2)}│`));
 					}
 
-					// Bottom border
 					const scrollInfo =
-						totalDL > maxDL ? ` ${startDL + 1}-${endDL}/${totalDL} ` : "";
+						diffLines.length > pageSize
+							? ` ${scrollOffset + 1}-${end}/${diffLines.length} `
+							: "";
 					const footer = ` esc back  ↑↓ ctrl+u/d g/G  ←→ h/H scroll  ␣ toggle hunk${scrollInfo} `;
-					const fPad = Math.max(0, boxW - visibleWidth(footer));
-					lines.push(
-						theme.fg("borderAccent", `╰${footer}${"─".repeat(fPad)}╯`),
-					);
-
+					const fill = Math.max(0, boxWidth - visibleWidth(footer));
+					lines.push(theme.fg("borderAccent", `╰${footer}${"─".repeat(fill)}╯`));
 					return lines;
 				},
 
 				invalidate() {},
 
 				handleInput(data: string): void {
-					if (matchesKey(data, "up") || data === "k") {
-						scrollOffset = Math.max(0, scrollOffset - 1);
-						tui.requestRender();
-					} else if (matchesKey(data, "down") || data === "j") {
-						scrollOffset++;
-						tui.requestRender();
-					} else if (matchesKey(data, "ctrl+u")) {
-						scrollOffset = Math.max(0, scrollOffset - Math.floor(maxDL / 2));
-						tui.requestRender();
-					} else if (matchesKey(data, "ctrl+d")) {
-						scrollOffset += Math.floor(maxDL / 2);
-						tui.requestRender();
-					} else if (data === "g") {
-						scrollOffset = 0;
-						tui.requestRender();
-					} else if (data === "G") {
-						scrollOffset = Math.max(0, totalDL - maxDL);
-						tui.requestRender();
-					} else if (matchesKey(data, "left")) {
-						hScroll.val = Math.max(0, hScroll.val - 8);
+					if (matchesKey(data, "up") || data === "k") moveCursor(cursor - 1);
+					else if (matchesKey(data, "down") || data === "j") moveCursor(cursor + 1);
+					else if (matchesKey(data, "ctrl+u")) moveCursor(cursor - Math.floor(pageSize / 2));
+					else if (matchesKey(data, "ctrl+d")) moveCursor(cursor + Math.floor(pageSize / 2));
+					else if (data === "g") moveCursor(0);
+					else if (data === "G") moveCursor(diffLines.length - 1);
+					else if (matchesKey(data, "left")) {
+						hScroll = Math.max(0, hScroll - 8);
 						tui.requestRender();
 					} else if (matchesKey(data, "right")) {
-						hScroll.val += 8;
+						hScroll += 8;
 						tui.requestRender();
 					} else if (data === "h") {
-						hScroll.val = 0;
+						hScroll = 0;
 						tui.requestRender();
 					} else if (data === "H") {
-						hScroll.val = 99999;
+						hScroll = 99999;
 						tui.requestRender();
 					} else if (data === " ") {
-						// Toggle hunk at current scroll position
-						const hi = hunkMap[scrollOffset];
-						if (hi >= 0) {
-							hunks[hi].accepted = !hunks[hi].accepted;
-							if (onHunkToggle) onHunkToggle();
+						const hunk = hunks[hunkOfLine[cursor]];
+						if (hunk) {
+							hunk.accepted = !hunk.accepted;
+							onHunkToggle?.();
 							tui.requestRender();
 						}
-					} else if (matchesKey(data, "escape")) {
-						done();
-					}
+					} else if (matchesKey(data, "escape")) done();
 				},
 			};
 		},
 		{ overlay: true, overlayOptions: { anchor: "center", margin: 1 } },
 	);
-	return { action: "back" };
 }
+

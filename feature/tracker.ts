@@ -1,171 +1,152 @@
-import {
-	existsSync,
-	lstatSync,
-	mkdirSync,
-	readFileSync,
-	readdirSync,
-	readlinkSync,
-	realpathSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { realpathSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Change } from "../types";
-import { applyHunks, diffFiles, parseHunks } from "../utils/diff";
+import type { Base, Step, StepEffect, VetData } from "../types";
+import { diffFiles, parseHunks } from "../utils/diff";
 import { extractBashPaths } from "../utils/bash-paths";
-import { saveState } from "../config/store";
+import { diskView, replay, sameState, stepsFor, type FileState } from "./replay";
 
-// ---------------------------------------------------------------------------
-// Tool tracking
-// ---------------------------------------------------------------------------
-
-/** Walk a directory recursively, return all file paths inside. */
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_FILES = 2000;
+const SKIPPED_DIRS = new Set(["node_modules", ".git"]);
+const TRACKED_TOOLS = new Set([
+	"edit",
+	"write",
+	"replace",
+	"replace_match",
+	"insert",
+	"copy",
+	"move",
+	"undo_last_change",
+	"bash",
+]);
+const PATH_INPUT_TOOLS = new Set(["write", "undo_last_change"]);
+const OPTIONAL_PATH_TOOLS = new Set(["replace", "replace_match", "insert"]);
+const CROSS_FILE_TOOLS = new Set(["copy", "move"]);
+const INTERNAL_SCHEMES =
+	/^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
+const PATCH_PATH = /^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/;
 
-async function walkDir(dir: string, budget: { bytes: number; files: number }): Promise<string[]> {
+interface Snapshot {
+	path: string;
+	content: string;
+	existed: boolean;
+}
+
+interface PendingCall {
+	snapshots: Snapshot[];
+	watchedFiles: Set<string>;
+	watchedDirectories: string[];
+}
+
+async function readText(path: string): Promise<string | null> {
+	const buffer = await readFile(path);
+	return buffer.includes(0) ? null : buffer.toString("utf8");
+}
+
+async function walkDir(dir: string, budget: { files: number }): Promise<string[]> {
 	const files: string[] = [];
 	try {
-		const entries = await readdir(dir, { withFileTypes: true });
-		for (const entry of entries) {
+		for (const entry of await readdir(dir, { withFileTypes: true })) {
 			if (budget.files <= 0) break;
 			const full = join(dir, entry.name);
 			if (entry.isDirectory()) {
-				files.push(...await walkDir(full, budget));
+				if (!SKIPPED_DIRS.has(entry.name)) files.push(...(await walkDir(full, budget)));
 			} else if (entry.isFile()) {
 				budget.files--;
 				files.push(full);
 			}
 		}
 	} catch {
-		/* ignore */
+		return files;
 	}
 	return files;
 }
 
-// ponytail: 8MiB/2000-file snapshot cap; raise if legit large dirs need full tracking
-async function snapshotPath(
-	abs: string,
-): Promise<Array<{ path: string; content: string; existed: boolean }>> {
+async function snapshotFile(path: string, budget: { bytes: number }): Promise<Snapshot | null> {
+	const { size } = await stat(path);
+	if (size > budget.bytes) return null;
+	const content = await readText(path);
+	if (content === null) return null;
+	budget.bytes -= size;
+	return { path, content, existed: true };
+}
+
+async function readState(path: string): Promise<FileState> {
 	try {
-		const s = await stat(abs);
-		if (s.isDirectory()) {
-			const budget = { bytes: MAX_SNAPSHOT_BYTES, files: MAX_SNAPSHOT_FILES };
-			const files = await walkDir(abs, budget);
-			const out: Array<{ path: string; content: string; existed: boolean }> = [];
-			for (const f of files) {
-				const st = await stat(f);
-				if (st.size > budget.bytes) break;
-				budget.bytes -= st.size;
-				out.push({ path: f, content: await readFile(f, "utf8"), existed: true });
-			}
-			return out;
-		}
-		if (s.size > MAX_SNAPSHOT_BYTES) return [];
-		return [{ path: abs, content: await readFile(abs, "utf8"), existed: true }];
+		return { content: (await readText(path)) ?? "", exists: true };
 	} catch {
-		return [{ path: abs, content: "", existed: false }];
+		return { content: "", exists: false };
 	}
 }
 
-export function createTracker(
-	cwd: string,
-	getChanges: () => Change[],
-	nextId: { val: number },
-) {
-	const changes = () => getChanges();
-	const originals = new Map<
-		string,
-		{ path: string; content: string; existed: boolean }
-	>();
-	/** Change ids touched during the current agent turn (for agent_end review). */
-	const turnIds = new Set<string>();
+function effectOf(before: FileState, after: FileState): StepEffect {
+	if (!before.exists && after.exists) return "new";
+	if (before.exists && !after.exists) return "del";
+	return "mod";
+}
+
+function pathsOf(toolName: string, input: unknown, cwd: string): string[] {
+	const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+	if (toolName === "edit") {
+		const patch = typeof input === "string" ? input : obj.input;
+		const fromPatch = typeof patch === "string" ? patch.match(PATCH_PATH)?.[1] : undefined;
+		const path = typeof obj.path === "string" ? obj.path : fromPatch;
+		return path ? [path] : [];
+	}
+	if (PATH_INPUT_TOOLS.has(toolName)) return typeof obj.path === "string" ? [obj.path] : [];
+	if (OPTIONAL_PATH_TOOLS.has(toolName)) return [typeof obj.path === "string" ? obj.path : cwd];
+	if (CROSS_FILE_TOOLS.has(toolName)) return [cwd];
+	if (toolName === "bash") return extractBashPaths(typeof obj.command === "string" ? obj.command : "");
+	return [];
+}
+
+export function createTracker(cwd: string, getData: () => VetData, save: () => void) {
+	const pending = new Map<string, PendingCall>();
+	let touched = false;
 
 	function shouldTrack(abs: string): boolean {
-		// Literal path must be under cwd (symlinks may resolve outside)
 		if (abs !== cwd && !abs.startsWith(cwd + "/")) return false;
-		try {
-			const resolved = realpathSync(abs);
+		const allowed = (path: string) => {
+			const resolved = `${realpathSync(path)}/`;
 			return (
 				!resolved.includes("/node_modules/") &&
 				!resolved.includes("/.git/") &&
-				!resolved.includes("/.pi-vet/")
+				!resolved.includes("/.pi/pi-vet/")
 			);
+		};
+		try {
+			return allowed(abs);
 		} catch {
-			// File doesn't exist yet — check parent
-			const parent = dirname(abs);
 			try {
-				const resolved = realpathSync(parent);
-				return (
-					!resolved.includes("/node_modules/") &&
-					!resolved.includes("/.git/")
-				);
+				return allowed(dirname(abs));
 			} catch {
 				return false;
 			}
 		}
 	}
 
-	/** Internal URI schemes that should never be tracked as file paths. */
-	const INTERNAL_SCHEMES =
-		/^(xd|skill|memory|agent|history|artifact|local|rule|omp|mcp|issue|pr):\/\//;
+	const absOf = (p: string) => (isAbsolute(p) ? p : resolve(cwd, p));
 
-	function absOf(p: string): string {
-		return isAbsolute(p) ? p : resolve(cwd, p);
-	}
-
-	function writeChangeToDisk(c: Change): void {
-		// Symlink: accept = no-op (tool already created it), reject = remove
-		try {
-			if (lstatSync(c.filePath).isSymbolicLink()) {
-				if (c.status === "reverted") {
-					rmSync(c.filePath, { force: true });
-				}
-				return;
-			}
-		} catch {
-			/* not a symlink, proceed normally */
+	// ponytail: 8MiB/2000-file snapshot cap per tool call; raise if legit large dirs need full tracking
+	async function watch(abs: string, call: PendingCall, budget: { bytes: number }): Promise<void> {
+		const info = await stat(abs).catch(() => null);
+		if (!info) {
+			call.snapshots.push({ path: abs, content: "", existed: false });
+			call.watchedDirectories.push(abs);
+			return;
 		}
-
-		const final = applyHunks(c.originalContent, c.hunks);
-		if (c.existed || final.length > 0) {
-			const dir = dirname(c.filePath);
-			if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-			writeFileSync(c.filePath, final, "utf8");
-		} else {
-			rmSync(c.filePath, { force: true });
-			try {
-				const parent = dirname(c.filePath);
-				if (readdirSync(parent).length === 0)
-					rmSync(parent, { force: true });
-			} catch {
-				/* ignore */
-			}
+		if (!info.isDirectory()) {
+			const snap = await snapshotFile(abs, budget);
+			if (snap) call.snapshots.push(snap);
+			return;
 		}
-	}
-
-	function mergeOrPush(change: Change): void {
-		const existing = changes().find(
-			(c) =>
-				c.filePath === change.filePath &&
-				c.sessionId === change.sessionId &&
-				(c.status === "pending" || c.status === "partial"),
-		);
-		if (existing) {
-			existing.hunks = change.hunks;
-			existing.originalContent = change.originalContent;
-			existing.existed = change.existed;
-			existing.toolName = change.toolName;
-			existing.timestamp = change.timestamp;
-			existing.status = "pending";
-			existing.checked = true;
-			turnIds.add(existing.id);
-		} else {
-			changes().push(change);
-			turnIds.add(change.id);
+		call.watchedDirectories.push(abs);
+		for (const file of await walkDir(abs, { files: MAX_SNAPSHOT_FILES })) {
+			if (!shouldTrack(file)) continue;
+			call.watchedFiles.add(file);
+			const snap = await snapshotFile(file, budget).catch(() => null);
+			if (snap) call.snapshots.push(snap);
 		}
 	}
 
@@ -174,207 +155,135 @@ export function createTracker(
 		toolCallId: string;
 		input: unknown;
 	}): Promise<void> {
+		if (!TRACKED_TOOLS.has(event.toolName)) return;
 		try {
-			if (event.toolName === "edit") {
-				// edit input: string patch "[PATH#TAG]\nPUT ..." or object { input: patch }
-				const input = event.input;
-				let p = "";
-				if (typeof input === "string") {
-					const m = input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/);
-					if (m) p = m[1];
-				} else if (input && typeof input === "object") {
-					const obj = input as Record<string, unknown>;
-					if (typeof obj.path === "string") p = obj.path;
-					else if (typeof obj.input === "string") {
-						const m = obj.input.match(/^\[([^\]#]+)(?:#[A-F0-9]{4})?\]/);
-						if (m) p = m[1];
-					}
-				}
-				if (!p || INTERNAL_SCHEMES.test(p)) return;
+			const call: PendingCall = { snapshots: [], watchedFiles: new Set(), watchedDirectories: [] };
+			const budget = { bytes: MAX_SNAPSHOT_BYTES };
+			for (const p of pathsOf(event.toolName, event.input, cwd)) {
+				if (INTERNAL_SCHEMES.test(p)) continue;
 				const abs = absOf(p);
-				if (!shouldTrack(abs)) return;
-				const snapshots = await snapshotPath(abs);
-				if (snapshots.length === 1) {
-					originals.set(event.toolCallId, {
-						path: snapshots[0].path,
-						content: snapshots[0].content,
-						existed: snapshots[0].existed,
-					});
-				} else {
-					originals.set(event.toolCallId, {
-						path: "",
-						content: JSON.stringify(snapshots),
-						existed: true,
-					});
-				}
-			} else if (
-				event.toolName === "write" ||
-				event.toolName === "replace" ||
-				event.toolName === "insert" ||
-				event.toolName === "undo_last_change"
-			) {
-				const input = event.input as Record<string, unknown>;
-				const p = typeof input.path === "string" ? input.path : "";
-				if (!p || INTERNAL_SCHEMES.test(p)) return;
-				const abs = absOf(p);
-				if (!shouldTrack(abs)) return;
-				const snapshots = await snapshotPath(abs);
-				if (snapshots.length === 1) {
-					originals.set(event.toolCallId, {
-						path: snapshots[0].path,
-						content: snapshots[0].content,
-						existed: snapshots[0].existed,
-					});
-				} else {
-					originals.set(event.toolCallId, {
-						path: "",
-						content: JSON.stringify(snapshots),
-						existed: true,
-					});
-				}
-			} else if (event.toolName === "bash") {
-				const input = event.input as Record<string, unknown>;
-				const cmd = typeof input.command === "string" ? input.command : "";
-				const paths = extractBashPaths(cmd);
-				if (paths.length === 0) return;
-				const entries: Array<{
-					path: string;
-					content: string;
-					existed: boolean;
-				}> = [];
-				for (const p of paths) {
-					const abs = absOf(p);
-					if (!shouldTrack(abs)) continue;
-					const snapshots = await snapshotPath(abs);
-					for (const s of snapshots) entries.push(s);
-				}
-				if (entries.length > 0)
-					originals.set(event.toolCallId, {
-						path: "",
-						content: JSON.stringify(entries),
-						existed: true,
-					});
+				if (shouldTrack(abs)) await watch(abs, call, budget);
+			}
+			if (call.snapshots.length > 0 || call.watchedDirectories.length > 0) {
+				pending.set(event.toolCallId, call);
 			}
 		} catch {
-			/* ignore */
+			return;
+		}
+	}
+
+	async function createdFiles(call: PendingCall): Promise<Snapshot[]> {
+		const created: Snapshot[] = [];
+		for (const directory of call.watchedDirectories) {
+			for (const file of await walkDir(directory, { files: MAX_SNAPSHOT_FILES })) {
+				if (call.watchedFiles.has(file) || !shouldTrack(file)) continue;
+				call.watchedFiles.add(file);
+				created.push({ path: file, content: "", existed: false });
+			}
+		}
+		return created;
+	}
+
+	async function makeStep(
+		base: Base,
+		seq: number,
+		toolName: string,
+		origin: Step["origin"],
+		before: FileState,
+		after: FileState,
+	): Promise<Step> {
+		const diff = await diffFiles(before.content, after.content, base.relPath);
+		return {
+			id: `${seq}:${base.relPath}`,
+			seq,
+			filePath: base.filePath,
+			relPath: base.relPath,
+			sessionId: base.sessionId,
+			toolName,
+			origin,
+			effect: effectOf(before, after),
+			status: "pending",
+			hunks: parseHunks(diff),
+			checked: true,
+			timestamp: Date.now(),
+		};
+	}
+
+	function expectedState(data: VetData, base: Base): FileState | null {
+		try {
+			return replay(base, stepsFor(data, base), diskView);
+		} catch {
+			return null;
 		}
 	}
 
 	async function onToolResult(
-		event: {
-			toolName: string;
-			toolCallId: string;
-		},
+		event: { toolName: string; toolCallId: string },
 		sessionId: string,
 	): Promise<void> {
+		const call = pending.get(event.toolCallId);
+		if (!call) return;
+		pending.delete(event.toolCallId);
 		try {
-			if (
-				event.toolName !== "edit" &&
-				event.toolName !== "write" &&
-				event.toolName !== "replace" &&
-				event.toolName !== "insert" &&
-				event.toolName !== "undo_last_change" &&
-				event.toolName !== "bash"
-			)
-				return;
-			const orig = originals.get(event.toolCallId);
-			if (!orig) return;
-			originals.delete(event.toolCallId);
-
-			const targets: Array<{
-				abs: string;
-				originalContent: string;
-				existed: boolean;
+			const taken = [...call.snapshots, ...(await createdFiles(call))];
+			const data = getData();
+			const plans: Array<{
+				base: Base;
+				before: FileState;
+				after: FileState;
+				drifted: FileState | null;
+				changed: boolean;
 			}> = [];
-			if (event.toolName === "bash" || orig.path === "") {
-				try {
-					const entries = JSON.parse(orig.content) as Array<{
-						path: string;
-						content: string;
-						existed: boolean;
-					}>;
-					for (const e of entries)
-						targets.push({
-							abs: e.path,
-							originalContent: e.content,
-							existed: e.existed,
-						});
-				} catch {
-					return;
-				}
-			} else {
-				targets.push({
-					abs: orig.path,
-					originalContent: orig.content,
-					existed: orig.existed,
-				});
-			}
-
-			for (const t of targets) {
-				let current = "";
-				let deleted = false;
-				let isSymlink = false;
-				try {
-					current = await readFile(t.abs, "utf8");
-				} catch {
-					// readFileSync fails on directories and some special files.
-					// Check if it's a symlink (e.g. ln -s /some/dir ./ext).
-					try {
-						if (lstatSync(t.abs).isSymbolicLink()) {
-							isSymlink = true;
-							current = `symlink -> ${readlinkSync(t.abs)}`;
-						} else {
-							deleted = true;
-						}
-					} catch {
-						deleted = true;
-					}
-				}
-				if (!deleted && !isSymlink && current === t.originalContent) continue;
-
-				const diff = await diffFiles(
-					t.originalContent,
-					deleted ? "" : current,
-					relative(cwd, t.abs),
-					cwd,
-				);
-				const hunks = parseHunks(diff);
-
-				mergeOrPush({
-					id: `c${nextId.val++}`,
-					filePath: t.abs,
-					relPath: relative(cwd, t.abs),
-					toolName: event.toolName,
-					originalContent: t.originalContent,
-					existed: t.existed,
-					status: "pending",
-					hunks,
-					checked: true,
-					timestamp: Date.now(),
-					batchId: 0,
+			for (const snap of taken) {
+				const before: FileState = { content: snap.content, exists: snap.existed };
+				const after = await readState(snap.path);
+				const known = data.bases.find((b) => b.filePath === snap.path);
+				const expected = known ? expectedState(data, known) : null;
+				const drifted = expected && !sameState(expected, before) ? expected : null;
+				const changed = !sameState(before, after);
+				if (!changed && !drifted) continue;
+				const base: Base = known ?? {
+					filePath: snap.path,
+					relPath: relative(cwd, snap.path),
 					sessionId,
-				});
+					content: before.content,
+					existed: before.exists,
+				};
+				plans.push({ base, before, after, drifted, changed });
 			}
-			saveState(changes(), cwd);
+			if (plans.length === 0) return;
+
+			let seq = Math.max(0, ...data.steps.map((s) => s.seq));
+			for (const plan of plans) {
+				if (!data.bases.includes(plan.base)) data.bases.push(plan.base);
+				if (plan.drifted)
+					data.steps.push(
+						await makeStep(plan.base, ++seq, "external", "external", plan.drifted, plan.before),
+					);
+			}
+			const toolSeq = ++seq;
+			for (const plan of plans) {
+				if (!plan.changed) continue;
+				data.steps.push(
+					await makeStep(plan.base, toolSeq, event.toolName, "agent", plan.before, plan.after),
+				);
+				touched = true;
+			}
+			save();
 		} catch {
-			/* ignore */
+			return;
 		}
 	}
 
-	function clear(): void {
-		originals.clear();
-	}
-
-	/** Return and clear the set of change ids touched this turn. */
-	function takeTurnIds(): Set<string> {
-		const ids = new Set(turnIds);
-		turnIds.clear();
-		return ids;
-	}
-
-	return { onToolCall, onToolResult, clear, takeTurnIds, writeChangeToDisk };
+	return {
+		onToolCall,
+		onToolResult,
+		clear: () => pending.clear(),
+		takeTouched(): boolean {
+			const was = touched;
+			touched = false;
+			return was;
+		},
+	};
 }
-
-
-
 

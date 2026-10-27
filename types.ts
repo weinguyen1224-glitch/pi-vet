@@ -1,10 +1,3 @@
-// ---------------------------------------------------------------------------
-// Types
-// pi-vet: file change review for Pi coding agent
-
-// SMOKE-TEST: 2026-08-14
-// pi-vet: file change review for Pi coding agent
-/** Hunk represents one diff hunk with accept/reject state. */
 export interface Hunk {
 	id: string;
 	header: string;
@@ -12,27 +5,33 @@ export interface Hunk {
 	accepted: boolean;
 }
 
-export interface Change {
-	id: string;
+export type StepEffect = "new" | "del" | "mod";
+
+export interface Base {
 	filePath: string;
 	relPath: string;
-	toolName: string;
-	originalContent: string;
+	sessionId: string;
+	content: string;
 	existed: boolean;
-	status: "pending" | "accepted" | "reverted" | "partial";
+}
+
+export interface Step {
+	id: string;
+	seq: number;
+	filePath: string;
+	relPath: string;
+	sessionId: string;
+	toolName: string;
+	origin: "agent" | "external";
+	effect: StepEffect;
+	status: "pending" | "accepted" | "reverted";
 	hunks: Hunk[];
 	checked: boolean;
 	timestamp: number;
-	batchId: number;
-	/** Owning agent session id — scopes reviews so concurrent agents in the
-	 *  same folder don't see each other's changes. */
-	sessionId: string;
 }
 
-
-export interface VetState {
-	changes: Change[];
-	/** Change ids produced by the most recent agent turn that touched files. */
-	lastTurnIds: string[];
+export interface VetData {
+	bases: Base[];
+	steps: Step[];
 }
 

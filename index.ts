@@ -1,52 +1,31 @@
-/**
- * pi-vet — TUI terminal file change review: accept, revert, undo.
- *
- * Tracks file changes made by the agent (edit/write/bash), then after each
- * agent turn shows a review UI: file list with +N/-N stats, checkboxes,
- * diff preview on enter, esc to apply.
- *
- * Model: agent applies directly (like Zed), review happens after.
- * Revert = recompute file from original + only accepted hunks.
- * State persists to .pi/pi-vet/state.json across restarts.
- *
- * /vet when no pending changes → shows most recent batch with Undo option.
- * /vet off → disable tracking. /vet on → re-enable.
- */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Change } from "./types";
-import { loadState, loadEnabled, saveEnabled, saveState } from "./config/store";
+import type { VetData } from "./types";
+import { loadEnabled, loadSession, saveEnabled, saveSession } from "./config/store";
 import { createTracker } from "./feature/tracker";
 import { showReview } from "./renderer/review-list";
-import { showHistory } from "./renderer/history-list";
+import { showRewind } from "./renderer/rewind";
 
 export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
-	const nextId = { val: 1 };
-	const reviewActive = { val: false };
 	let enabled = loadEnabled(cwd);
 	let sessionId = "";
-	let lastTurnIds: string[] = [];
-	let changes: Change[] = [];
+	let data: VetData = { bases: [], steps: [] };
 	let hydrated = false;
+	let reviewActive = false;
 
-	const tracker = createTracker(cwd, () => changes, nextId);
+	const save = () => saveSession(cwd, sessionId, data);
+	const tracker = createTracker(cwd, () => data, save);
 
 	function hydrate(ctx: { sessionManager: { getSessionId(): string } }): void {
 		sessionId = ctx.sessionManager.getSessionId();
 		if (hydrated) return;
 		hydrated = true;
-		const loaded = loadState(cwd, sessionId);
-		changes = loaded.changes;
-		lastTurnIds = loaded.lastTurnIds;
-		nextId.val = Math.max(nextId.val, loaded.nextId);
+		data = loadSession(cwd, sessionId);
 	}
 
-	function persist(turnIds: string[] = lastTurnIds): void {
-		lastTurnIds = turnIds;
-		saveState(changes, cwd, lastTurnIds);
-	}
+	const pendingSteps = () => data.steps.filter((s) => s.status === "pending");
+	const settledSteps = () => data.steps.filter((s) => s.status !== "pending");
 
-	// ---- tool tracking ----
 	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return;
 		hydrate(ctx);
@@ -56,84 +35,58 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_result", async (event, ctx) => {
 		if (!enabled) return;
 		hydrate(ctx);
-		await tracker.onToolResult(event, ctx.sessionManager.getSessionId());
+		await tracker.onToolResult(event, sessionId);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		hydrate(ctx);
-		const turnIds = tracker.takeTurnIds();
 		tracker.clear();
-		if (turnIds.size === 0) return;
-		persist([...turnIds]);
-		if (!enabled || !ctx.hasUI) return;
-		showReview(
-			ctx,
-			changes,
-			cwd,
-			reviewActive,
-			tracker.writeChangeToDisk,
-			turnIds,
-			sessionId,
-		).catch(() => {});
+		if (!tracker.takeTouched() || !enabled || !ctx.hasUI || reviewActive) return;
+		reviewActive = true;
+		showReview(ctx, data, pendingSteps(), "pi-vet: review agent changes", save)
+			.catch((e: Error) => ctx.ui.notify(`pi-vet: ${e.message}`, "error"))
+			.finally(() => {
+				reviewActive = false;
+			});
 	});
+
+	pi.on("session_shutdown", async (event) => {
+		if (event.reason !== "quit" || !sessionId) return;
+		saveSession(cwd, sessionId, { bases: [], steps: [] });
+	});
+
 	pi.registerCommand("vet", {
-		description:
-			"Review pending agent changes (or undo last batch). /vet off to disable.",
+		description: "Review pending agent changes, or history. /vet history | rewind | off | on.",
 		handler: async (args, ctx) => {
-			const sub: string = Array.isArray(args)
-				? (args[0] ?? "")
-				: typeof args === "string"
-					? args
-					: "";
-			if (sub === "off") {
-				enabled = false;
-				saveEnabled(false, cwd);
-				ctx.ui.notify("pi-vet tracking disabled", "info");
-				return;
-			}
-			if (sub === "on") {
-				enabled = true;
-				saveEnabled(true, cwd);
-				ctx.ui.notify("pi-vet tracking enabled", "info");
+			const sub = (Array.isArray(args) ? (args[0] ?? "") : typeof args === "string" ? args : "").trim();
+			if (sub === "off" || sub === "on") {
+				enabled = sub === "on";
+				saveEnabled(enabled, cwd);
+				ctx.ui.notify(`pi-vet tracking ${enabled ? "enabled" : "disabled"}`, "info");
 				return;
 			}
 
 			hydrate(ctx);
-
-			const scoped = changes.filter((c) => c.sessionId === sessionId);
-			const pending = scoped.filter(
-				(c) => c.status === "pending" || c.status === "partial",
-			);
-			if (pending.length > 0) {
-				// Show only the most recent turn that touched files, so /vet never
-				// reopens stale pending changes from earlier turns.
-				const turnIds = new Set(lastTurnIds);
-				await showReview(
-					ctx,
-					changes,
-					cwd,
-					reviewActive,
-					tracker.writeChangeToDisk,
-					turnIds,
-					sessionId,
-				);
-				persist();
-			} else {
-				const history = scoped.filter(
-					(c) => c.status === "accepted" || c.status === "reverted",
-				);
-				if (history.length === 0) {
+			if (reviewActive) return;
+			reviewActive = true;
+			try {
+				if (sub === "rewind") {
+					await showRewind(ctx, data, save);
+					return;
+				}
+				const steps = sub === "history" ? settledSteps() : pendingSteps();
+				const fallback = sub === "history" ? [] : settledSteps();
+				const shown = steps.length > 0 ? steps : fallback;
+				if (shown.length === 0) {
 					ctx.ui.notify("No changes to review", "info");
 					return;
 				}
-				const latestBatch = Math.max(...history.map((c) => c.batchId));
-				const batch = history.filter((c) => c.batchId === latestBatch);
-				await showHistory(ctx, changes, batch, cwd, tracker.writeChangeToDisk);
-				persist();
+				const title = shown === steps && sub !== "history" ? "pi-vet: review agent changes" : "pi-vet: history";
+				await showReview(ctx, data, shown, title, save);
+			} finally {
+				reviewActive = false;
 			}
 		},
 	});
 }
-
-
 
